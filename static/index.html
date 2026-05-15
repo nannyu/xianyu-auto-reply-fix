@@ -207,13 +207,16 @@
     <!-- 仪表盘内容 -->
     <div id="dashboard-section" class="content-section active">
       <div class="content-header">
-        <div class="d-flex justify-content-between align-items-center">
-          <div>
-            <h2 class="mb-0">
-              <i class="bi bi-speedometer2 me-2"></i>
-              仪表盘
-            </h2>
-            <p class="text-muted mb-0">系统概览和统计信息</p>
+        <div class="dashboard-header-shell">
+          <div class="dashboard-header-main">
+            <div class="dashboard-header-copy">
+              <h2 class="mb-0">
+                <i class="bi bi-speedometer2 me-2"></i>
+                仪表盘
+              </h2>
+              <p class="text-muted mb-0">系统概览和统计信息</p>
+            </div>
+            <div class="dashboard-announcement-slot" id="dashboardAnnouncementSlot" style="display: none;"></div>
           </div>
           <div class="version-info d-flex gap-2">
             <span class="badge d-inline-flex align-items-center sponsor-pill" onclick="showSection('about')" title="赞助作者">
@@ -461,35 +464,39 @@
                     <i class="bi bi-qr-code me-2"></i>
                     <span class="fw-bold">扫码登录</span>
                     <br>
-                    <small class="opacity-75">只有账号不需要人脸的时候推荐使用</small>
+                    <small class="opacity-75">适合直接添加新账号</small>
                   </button>
                   <button type="button" class="btn btn-outline-primary btn-lg flex-fill password-login-btn" onclick="togglePasswordLogin()" style="max-width: 300px;">
                     <i class="bi bi-key me-2"></i>
-                    <span class="fw-bold">账号密码登录</span>
+                    <span class="fw-bold">账密登录</span>
                     <br>
-                    <small class="opacity-75">请务必优先使用账号和密码登录</small>
-                  </button>
-                  <button type="button" class="btn btn-outline-secondary btn-lg flex-fill manual-input-btn" onclick="toggleManualInput()" style="max-width: 300px;">
-                    <i class="bi bi-keyboard me-2"></i>
-                    <span class="fw-bold">手动输入</span>
-                    <br>
-                    <small class="opacity-75">使用消息界面的cookie</small>
+                    <small class="opacity-75">需填写账号密码，成功后自动保存</small>
                   </button>
                   <button type="button" class="btn btn-outline-warning btn-lg flex-fill refresh-cookie-btn" onclick="toggleRefreshCookieForm()" style="max-width: 300px;">
                     <i class="bi bi-arrow-repeat me-2"></i>
-                    <span class="fw-bold">刷新Cookie</span>
+                    <span class="fw-bold">手动刷新 Cookie</span>
                     <br>
-                    <small class="opacity-75">验证账密并刷新已有账号</small>
+                    <small class="opacity-75">使用已保存账密手动刷新已有账号</small>
+                  </button>
+                  <button type="button" class="btn btn-outline-secondary btn-lg flex-fill manual-input-btn" onclick="toggleManualInput()" style="max-width: 300px;">
+                    <i class="bi bi-keyboard me-2"></i>
+                    <span class="fw-bold">导入 Cookie</span>
+                    <br>
+                    <small class="opacity-75">手动导入消息页 Cookie</small>
                   </button>
                 </div>
               </div>
+            </div>
+
+            <div class="text-center text-muted small mb-4">
+              建议优先使用扫码登录或账密登录添加账号，并尽快配置账密。未配置账密时，账号掉线后部分风控与恢复场景可能无法继续处理；如遇掉线，可优先尝试扫码登录或手动刷新 Cookie。
             </div>
 
             <!-- 账号密码登录表单（默认隐藏） -->
             <div id="passwordLoginForm" style="display: none;">
               <div class="alert alert-info">
                 <i class="bi bi-info-circle me-2"></i>
-                <strong>提示：</strong>使用账号密码登录，系统将自动获取Cookie。登录过程可能需要处理滑块验证，请耐心等待。
+                <strong>提示：</strong>用于新增账号或重新获取 Cookie，登录成功后会自动保存账密。登录过程中可能出现滑块或人脸验证，请耐心等待。
               </div>
               <form id="passwordLoginFormElement" class="row g-3">
                 <div class="col-md-4">
@@ -527,7 +534,7 @@
             <div id="manualInputForm" style="display: none;">
               <div class="alert alert-info">
                 <i class="bi bi-info-circle me-2"></i>
-                <strong>提示：</strong>推荐使用扫码登录，更加安全便捷。如需手动输入，请确保Cookie信息的准确性。
+                <strong>提示：</strong>用于手动导入已有 Cookie，建议优先使用消息页 Cookie。导入后请尽快在账号设置中配置账密，便于后续刷新与恢复。
               </div>
               <form id="addForm" class="row g-3">
                 <div class="col-md-3">
@@ -553,7 +560,7 @@
             <div id="refreshCookieForm" style="display: none;">
               <div class="alert alert-warning">
                 <i class="bi bi-exclamation-triangle me-2"></i>
-                <strong>提示：</strong>此功能将使用账号已配置的用户名和密码重新登录，刷新Cookie。请确保账号已配置正确的登录凭据。
+                <strong>提示：</strong>用于已有账号的手动账密刷新。本流程会读取该账号已保存的用户名和密码，并刷新当前账号 Cookie。
               </div>
               <form id="refreshCookieFormElement" class="row g-3">
                 <div class="col-md-6">
@@ -636,6 +643,93 @@
                 </thead>
                 <tbody></tbody>
               </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="about-diagnostics-card account-diagnostics-card card mt-4">
+          <div class="card-header d-flex justify-content-between align-items-start flex-wrap gap-3">
+            <div>
+              <span class="fw-semibold"><i class="bi bi-activity me-2"></i>账号保活诊断</span>
+              <div class="text-muted small mt-1">查看账号运行态，并手动执行轻保活或查询历史消息。</div>
+            </div>
+
+            <div class="account-diagnostics-toolbar">
+              <div class="account-diagnostics-picker">
+                <label for="aboutDiagnosticsAccount" class="form-label">诊断账号</label>
+                <select id="aboutDiagnosticsAccount" class="form-select">
+                  <option value="">加载中...</option>
+                </select>
+              </div>
+
+              <div class="account-diagnostics-actions">
+                <button type="button" class="btn btn-outline-secondary" id="aboutDiagnosticsRefreshBtn">
+                  <i class="bi bi-arrow-clockwise me-1"></i>刷新状态
+                </button>
+                <button type="button" class="btn btn-primary" id="aboutDiagnosticsKeepaliveBtn">
+                  <i class="bi bi-lightning-charge me-1"></i>立即轻保活
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card-body">
+            <div id="aboutDiagnosticsAccountMeta" class="about-diagnostics-account-meta account-diagnostics-summary"></div>
+
+            <div class="account-diagnostics-layout">
+              <div class="about-status-panel account-diagnostics-main-panel">
+                <div class="account-diagnostics-section-head">
+                  <div>
+                    <div class="account-diagnostics-section-title">运行态总览</div>
+                    <div class="account-diagnostics-section-sub">优先看连接状态、轻保活状态和链路就绪情况。</div>
+                  </div>
+                </div>
+
+                <div id="aboutDiagnosticsStatus">
+                  <div class="about-placeholder">
+                    <i class="bi bi-hdd-network"></i>
+                    <div>
+                      <div class="about-placeholder-title">请选择账号</div>
+                      <div class="about-placeholder-sub">选择账号后会显示当前连接状态、轻保活结果和最近活动时间。</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="about-history-panel account-diagnostics-history-panel mt-4">
+              <div class="account-diagnostics-section-head">
+                <div>
+                  <div class="account-diagnostics-section-title">历史消息回放</div>
+                  <div class="account-diagnostics-section-sub">输入会话 ID 后查询最近 20 条消息，支持直接粘贴带 <code>@goofish</code> 的完整 ID。</div>
+                  </div>
+                </div>
+
+              <div class="account-diagnostics-history-form">
+                <label for="aboutDiagnosticsConversationId" class="form-label">会话 ID</label>
+                <div class="account-diagnostics-history-input-wrap">
+                  <input
+                    type="text"
+                    id="aboutDiagnosticsConversationId"
+                    class="form-control"
+                    placeholder="输入或粘贴 conversation_id，例如 1234567890"
+                  >
+                  <button type="button" class="btn btn-primary" id="aboutDiagnosticsHistoryBtn">
+                    <i class="bi bi-chat-left-text me-1"></i>查询历史消息
+                  </button>
+                </div>
+                <div class="form-text">默认查询最近 20 条历史消息，可直接粘贴完整会话标识。</div>
+              </div>
+
+              <div id="aboutConversationHistory" class="about-history-list mt-3">
+                <div class="about-placeholder">
+                  <i class="bi bi-clock-history"></i>
+                  <div>
+                    <div class="about-placeholder-title">暂无历史消息</div>
+                    <div class="about-placeholder-sub">输入会话 ID 后即可查询并展示最近的历史消息。</div>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -946,7 +1040,10 @@
           </div>
           <div class="col-md-4">
             <label class="form-label">&nbsp;</label>
-            <div class="d-flex gap-2">
+            <div class="d-flex gap-2 flex-wrap justify-content-md-end">
+              <button class="btn btn-primary" onclick="openOrderHistorySyncModal()">
+                <i class="bi bi-clock-history"></i> 历史同步
+              </button>
               <button class="btn btn-outline-primary" onclick="refreshOrders()">
                 <i class="bi bi-arrow-clockwise"></i> 刷新
               </button>
@@ -1048,6 +1145,112 @@
                 </select>
               </div>
             </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal fade" id="orderHistorySyncModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+          <div class="modal-header">
+            <div>
+              <h5 class="modal-title mb-1">
+                <i class="bi bi-clock-history me-2"></i>历史订单同步
+              </h5>
+              <div class="text-muted small">按平台时间补抓历史订单，优先使用付款时间，适合首次补历史数据或按时间段回填。</div>
+            </div>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+          </div>
+          <div class="modal-body">
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-label">同步账号</label>
+                <select class="form-select" id="orderHistorySyncCookieId">
+                  <option value="">所有账号</option>
+                </select>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label">开始日期</label>
+                <input type="date" class="form-control" id="orderHistorySyncStartDate">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label">结束日期</label>
+                <input type="date" class="form-control" id="orderHistorySyncEndDate">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">最多同步单数</label>
+                <input type="number" class="form-control" id="orderHistorySyncMaxOrders" min="1" max="500" step="1" value="120">
+              </div>
+              <div class="col-md-8 d-flex align-items-end">
+                <div class="form-check form-switch mb-2">
+                  <input class="form-check-input" type="checkbox" id="orderHistorySyncFetchDetails" checked>
+                  <label class="form-check-label" for="orderHistorySyncFetchDetails">同步订单详情</label>
+                  <div class="text-muted small">开启后会补抓规格、金额和平台时间；关闭则只写入列表基础信息。</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card border-0 bg-light mt-4">
+              <div class="card-body">
+                <div class="d-flex flex-wrap justify-content-between align-items-start gap-3">
+                  <div>
+                    <div class="text-muted small">运行状态</div>
+                    <div class="fw-semibold" id="orderHistorySyncStatusText">未开始</div>
+                    <div class="text-muted small mt-1" id="orderHistorySyncMessageText">选择账号和日期范围后即可开始同步。</div>
+                  </div>
+                  <span class="badge bg-secondary text-white" id="orderHistorySyncStatusBadge">待命</span>
+                </div>
+
+                <div class="progress mt-3" style="height: 8px;">
+                  <div class="progress-bar" id="orderHistorySyncProgressBar" role="progressbar" style="width: 0%;"></div>
+                </div>
+
+                <div class="row g-2 mt-3">
+                  <div class="col-6 col-lg-3">
+                    <div class="border rounded-3 bg-white px-3 py-2 h-100">
+                      <div class="text-muted small">账号进度</div>
+                      <div class="fw-semibold" id="orderHistorySyncAccountsStat">0 / 0</div>
+                    </div>
+                  </div>
+                  <div class="col-6 col-lg-3">
+                    <div class="border rounded-3 bg-white px-3 py-2 h-100">
+                      <div class="text-muted small">扫描候选</div>
+                      <div class="fw-semibold" id="orderHistorySyncDiscoveredStat">0</div>
+                    </div>
+                  </div>
+                  <div class="col-6 col-lg-3">
+                    <div class="border rounded-3 bg-white px-3 py-2 h-100">
+                      <div class="text-muted small">命中范围</div>
+                      <div class="fw-semibold" id="orderHistorySyncMatchedStat">0</div>
+                    </div>
+                  </div>
+                  <div class="col-6 col-lg-3">
+                    <div class="border rounded-3 bg-white px-3 py-2 h-100">
+                      <div class="text-muted small">入库 / 失败</div>
+                      <div class="fw-semibold" id="orderHistorySyncSavedStat">0 / 0</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="small text-muted mt-3" id="orderHistorySyncMetaText">尚未开始任务</div>
+                <div class="small text-muted mt-1" id="orderHistorySyncCurrentText"></div>
+
+                <div class="mt-3" id="orderHistorySyncWarningsWrap" style="display: none;">
+                  <div class="small fw-semibold mb-2">运行提醒</div>
+                  <div id="orderHistorySyncWarnings" class="d-flex flex-column gap-2"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-danger me-auto" id="orderHistorySyncCancelBtn" onclick="cancelOrderHistorySync()" style="display: none;">
+              <i class="bi bi-x-circle"></i> 取消任务
+            </button>
+            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">关闭</button>
+            <button type="button" class="btn btn-primary" id="orderHistorySyncStartBtn" onclick="startOrderHistorySync()">
+              <i class="bi bi-play-circle"></i> 开始同步
+            </button>
           </div>
         </div>
       </div>
@@ -1745,6 +1948,7 @@
                       <div class="d-flex flex-wrap gap-1 mt-1">
                         <button class="btn btn-sm btn-outline-info" onclick="insertTemplateVariable('slider_success', '{account_id}')">{account_id}</button>
                         <button class="btn btn-sm btn-outline-info" onclick="insertTemplateVariable('slider_success', '{time}')">{time}</button>
+                        <button class="btn btn-sm btn-outline-info" onclick="insertTemplateVariable('slider_success', '{status_text}')">{status_text}</button>
                       </div>
                     </div>
                     <textarea class="form-control font-monospace" id="slider_success-template-editor" rows="12"
@@ -1781,6 +1985,7 @@
                       <div class="d-flex flex-wrap gap-1 mt-1">
                         <button class="btn btn-sm btn-outline-info" onclick="insertTemplateVariable('face_verify', '{account_id}')">{account_id}</button>
                         <button class="btn btn-sm btn-outline-info" onclick="insertTemplateVariable('face_verify', '{time}')">{time}</button>
+                        <button class="btn btn-sm btn-outline-info" onclick="insertTemplateVariable('face_verify', '{verification_action}')">{verification_action}</button>
                         <button class="btn btn-sm btn-outline-info" onclick="insertTemplateVariable('face_verify', '{verification_url}')">{verification_url}</button>
                         <button class="btn btn-sm btn-outline-info" onclick="insertTemplateVariable('face_verify', '{verification_type}')">{verification_type}</button>
                       </div>
@@ -2103,11 +2308,17 @@
                     </div>
                     <div>
                       <div class="risk-tool-card-kicker">滑块验证统计</div>
-                      <h6 class="mb-1">当前系统用户会话表现</h6>
-                      <p class="text-muted mb-0 small">仅统计新结构化滑块会话，不包含内部重试样本</p>
+                      <h6 class="mb-1">当前范围统计</h6>
                     </div>
                   </div>
-                  <span class="risk-tool-chip risk-slider-scope" id="riskSliderScope">全部账号</span>
+                  <div class="d-flex align-items-center gap-2 flex-wrap">
+                    <div class="risk-slider-range-group" id="riskSliderRangeFilter" role="group" aria-label="滑块统计时间范围">
+                      <button type="button" class="risk-slider-range-btn" data-range="today" onclick="onRiskSliderRangeChange('today')">当日</button>
+                      <button type="button" class="risk-slider-range-btn" data-range="7d" onclick="onRiskSliderRangeChange('7d')">7天</button>
+                      <button type="button" class="risk-slider-range-btn is-active" data-range="all" onclick="onRiskSliderRangeChange('all')">所有</button>
+                    </div>
+                    <span class="risk-tool-chip risk-slider-scope" id="riskSliderScope">全部账号</span>
+                  </div>
                 </div>
 
                 <div class="risk-slider-hero">
@@ -2120,22 +2331,22 @@
 
                 <div class="risk-slider-stats-grid">
                   <div class="risk-slider-stat-chip success">
-                    <span>成功会话</span>
+                    <span>成功次数</span>
                     <strong id="riskSliderSuccessCount">0</strong>
                   </div>
                   <div class="risk-slider-stat-chip danger">
-                    <span>失败会话</span>
+                    <span>失败次数</span>
                     <strong id="riskSliderFailureCount">0</strong>
                   </div>
                 </div>
 
                 <div class="risk-slider-stats-foot">
                   <div class="risk-slider-foot-item">
-                      <span>最近成功会话</span>
+                      <span>最近成功时间</span>
                     <strong id="riskSliderRecentSuccess">--</strong>
                   </div>
                   <div class="risk-slider-foot-item">
-                      <span>最近失败会话</span>
+                      <span>最近失败时间</span>
                     <strong id="riskSliderRecentFailure">--</strong>
                   </div>
                 </div>
@@ -2263,7 +2474,7 @@
                       <th>触发场景</th>
                       <th>状态</th>
                       <th>摘要</th>
-                      <th>结果 / 错误</th>
+                      <th>处理结果</th>
                       <th>耗时</th>
                       <th>链路ID</th>
                       <th>操作</th>
@@ -3031,7 +3242,6 @@
         <p class="text-muted mb-0">关于本项目</p>
       </div>
       <div class="content-body">
-
         <div class="about-donate-card">
           <p class="about-donate-title">如果这个项目帮到了你，欢迎请作者喝杯咖啡</p>
           <div class="about-donate-grid">
@@ -4680,13 +4890,13 @@
             <div class="mb-3">
               <label class="form-label">用户名</label>
               <input type="text" class="form-control" id="editAccountUsername" placeholder="输入用户名（可选）">
-              <div class="form-text">用于密码登录的用户名</div>
+              <div class="form-text">用于账密登录、手动刷新 Cookie 和自动恢复</div>
             </div>
             
             <div class="mb-3">
               <label class="form-label">密码</label>
               <input type="password" class="form-control" id="editAccountPassword" placeholder="输入密码（可选）">
-              <div class="form-text">用于密码登录的密码</div>
+              <div class="form-text">用于账密登录、手动刷新 Cookie 和自动恢复</div>
             </div>
             
             <div class="mb-3">
@@ -4694,12 +4904,12 @@
                 <input class="form-check-input" type="checkbox" id="editAccountShowBrowser">
                 <label class="form-check-label" for="editAccountShowBrowser">
                   显示浏览器
-                  <i class="bi bi-info-circle text-info ms-1" data-bs-toggle="tooltip" title="使用用户名密码登录的时候浏览器可见，仅限Windows源码部署打开该开关"></i>
+                  <i class="bi bi-info-circle text-info ms-1" data-bs-toggle="tooltip" title="控制该账号在账密相关流程中是否显示浏览器窗口"></i>
                 </label>
               </div>
               <div class="form-text text-warning">
                 <i class="bi bi-exclamation-triangle me-1"></i>
-                使用用户名密码登录的时候浏览器可见，仅限Windows源码部署打开该开关，开关打开密码登录会停留5分钟，防止第一次登录需要人脸，成功一次之后后续可关闭开关
+                该设置会影响账密登录、手动刷新 Cookie 和自动恢复流程。仅建议在本机排查滑块、人脸或风控页面时开启，服务器环境不要开启。
               </div>
             </div>
 
@@ -4751,8 +4961,8 @@
               <strong>提示：</strong>
               <ul class="mb-0 mt-2">
                 <li>Cookie是必填项，其他字段可选</li>
-                <li>配置用户名和密码后，系统可自动通过密码登录刷新Cookie</li>
-                <li>使用用户名密码登录的时候浏览器可见，仅限Windows源码部署打开该开关</li>
+                <li>配置用户名和密码后，系统可在需要时通过账密流程刷新 Cookie</li>
+                <li>开启“显示浏览器”后，该账号的账密相关流程会优先使用有头模式</li>
                 <li><strong>代理配置：</strong>为每个账号设置独立代理，可实现IP隔离，降低账号关联风险</li>
               </ul>
             </div>

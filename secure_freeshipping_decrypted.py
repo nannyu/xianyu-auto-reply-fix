@@ -17,6 +17,64 @@ class SecureFreeshipping:
         self.last_token_refresh_time = None
         self.token_refresh_interval = None
 
+    def _serialize_cookies(self, cookies_dict=None):
+        cookies = cookies_dict or self.cookies
+        return '; '.join([f"{k}={v}" for k, v in cookies.items() if k])
+
+    def _sync_session_cookie_header(self):
+        if self.session and not self.session.closed:
+            self.session.headers['cookie'] = self.cookies_str
+
+    def _set_runtime_cookie_state(self, cookies_dict=None, cookies_str=None):
+        normalized_cookies = dict(cookies_dict or trans_cookies(cookies_str or ""))
+        if not normalized_cookies:
+            return False
+
+        previous_cookie_string = self.cookies_str
+        self.cookies = normalized_cookies
+        self.cookies_str = self._serialize_cookies(normalized_cookies)
+        self._sync_session_cookie_header()
+        return self.cookies_str != previous_cookie_string
+
+    def _extract_set_cookie_updates(self, response_headers):
+        if not response_headers:
+            return {}
+
+        set_cookie_values = []
+        try:
+            if hasattr(response_headers, 'getall') and 'set-cookie' in response_headers:
+                set_cookie_values = response_headers.getall('set-cookie', [])
+            elif hasattr(response_headers, 'get_all'):
+                set_cookie_values = response_headers.get_all('set-cookie', [])
+            elif isinstance(response_headers, dict):
+                raw_value = response_headers.get('set-cookie') or response_headers.get('Set-Cookie')
+                if isinstance(raw_value, list):
+                    set_cookie_values = raw_value
+                elif raw_value:
+                    set_cookie_values = [raw_value]
+        except Exception:
+            set_cookie_values = []
+
+        updates = {}
+        for cookie in set_cookie_values:
+            if '=' not in cookie:
+                continue
+            name, value = cookie.split(';')[0].split('=', 1)
+            updates[name.strip()] = value.strip()
+        return updates
+
+    async def _apply_response_cookie_updates(self, response_headers):
+        updates = self._extract_set_cookie_updates(response_headers)
+        if not updates:
+            return False
+
+        merged_cookies = dict(self.cookies)
+        merged_cookies.update(updates)
+        changed = self._set_runtime_cookie_state(cookies_dict=merged_cookies)
+        if changed:
+            await self.update_config_cookies()
+        return changed
+
     def _safe_str(self, obj):
         """安全转换为字符串"""
         try:
@@ -94,22 +152,8 @@ class SecureFreeshipping:
             ) as response:
                 res_json = await response.json()
 
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-                    
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self.update_config_cookies()
-                        logger.debug("已更新Cookie到数据库")
+                if await self._apply_response_cookie_updates(response.headers):
+                    logger.debug("已更新Cookie到数据库")
 
                 logger.info(f"【{self.cookie_id}】自动免拼发货响应: {res_json}")
                 

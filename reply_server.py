@@ -3,16 +3,17 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Callable, Awaitable
 from pathlib import Path
 from urllib.parse import unquote
+from urllib import request as urllib_request, error as urllib_error
 import hashlib
 import secrets
 import time
 import json
 import os
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 import uvicorn
 import pandas as pd
 import io
@@ -28,11 +29,20 @@ from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
 from utils.time_utils import (
+    LOCAL_TIMEZONE,
     get_local_now,
     local_date_to_utc_end_exclusive,
     local_date_to_utc_start,
+    parse_db_timestamp,
     utc_timestamp_to_local_date_string,
     utc_timestamp_to_local_datetime,
+)
+from utils.notification_dispatcher import (
+    build_face_verify_notification,
+    SUPPORTED_NOTIFICATION_TEMPLATE_TYPES,
+    dispatch_account_notifications_sync,
+    render_notification_template,
+    resolve_verification_type_label,
 )
 from order_event_hub import order_event_hub, publish_order_update_event
 
@@ -122,6 +132,287 @@ SALES_ELIGIBLE_ORDER_STATUSES = {
     'shipped',
     'completed',
 }
+
+ORDER_SALES_TIME_SQL = "COALESCE(NULLIF(platform_paid_at, ''), NULLIF(platform_created_at, ''), created_at)"
+
+ORDER_HISTORY_SYNC_JOB_RETENTION_SECONDS = 3600
+order_history_sync_jobs: Dict[str, Dict[str, Any]] = {}
+order_history_sync_tasks: Dict[str, asyncio.Task] = {}
+ANNOUNCEMENT_CACHE_TTL_SECONDS = 300
+announcement_cache: Dict[str, Any] = {
+    'expires_at': 0.0,
+    'current': None,
+    'history': [],
+    'last_success_current': None,
+    'last_success_history': [],
+    'has_remote_success': False,
+}
+
+
+def _get_announcement_remote_url() -> str:
+    configured_url = str(os.getenv('DASHBOARD_ANNOUNCEMENT_URL') or '').strip()
+    if configured_url:
+        return configured_url
+
+    owner = str(os.getenv('UPDATE_GITHUB_OWNER') or 'GuDong2003').strip() or 'GuDong2003'
+    repo = str(os.getenv('UPDATE_GITHUB_REPO') or 'xianyu-auto-reply-fix').strip() or 'xianyu-auto-reply-fix'
+    branch = str(os.getenv('DASHBOARD_ANNOUNCEMENT_BRANCH') or 'main').strip() or 'main'
+    file_path = str(os.getenv('DASHBOARD_ANNOUNCEMENT_FILE') or 'announcement.json').strip().lstrip('/')
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
+
+
+def _get_announcement_local_path() -> Path:
+    file_path = str(os.getenv('DASHBOARD_ANNOUNCEMENT_FILE') or 'announcement.json').strip().lstrip('/')
+    return Path(__file__).parent / file_path
+
+
+def _parse_announcement_datetime(value: Any) -> Optional[datetime]:
+    raw_value = str(value or '').strip()
+    if not raw_value:
+        return None
+
+    normalized_value = raw_value.replace('Z', '+00:00') if raw_value.endswith('Z') else raw_value
+    try:
+        parsed = datetime.fromisoformat(normalized_value)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=LOCAL_TIMEZONE)
+    return parsed.astimezone(LOCAL_TIMEZONE)
+
+
+def _build_announcement_id(payload: Dict[str, Any]) -> str:
+    raw_id = str(payload.get('id') or '').strip()
+    if raw_id:
+        return raw_id
+
+    stable_source = json.dumps(
+        {
+            'level': str(payload.get('level') or '').strip(),
+            'title': str(payload.get('title') or '').strip(),
+            'message': str(payload.get('message') or '').strip(),
+            'action_text': str(payload.get('action_text') or '').strip(),
+            'action_type': str(payload.get('action_type') or '').strip(),
+            'action_url': str(payload.get('action_url') or '').strip(),
+            'dismissible': payload.get('dismissible', True),
+            'start_at': str(payload.get('start_at') or '').strip(),
+            'end_at': str(payload.get('end_at') or '').strip(),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return f"announcement-{hashlib.sha1(stable_source.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _coerce_announcement_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    normalized = str(value).strip().lower()
+    if normalized in {'1', 'true', 'yes', 'y', 'on', 'enabled'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'n', 'off', 'disabled', ''}:
+        return False
+    return default
+
+
+def _empty_dashboard_announcement_snapshot() -> Dict[str, Any]:
+    return {
+        'current': None,
+        'history': [],
+    }
+
+
+def _normalize_dashboard_announcement_entry(payload: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+
+    enabled = _coerce_announcement_bool(payload.get('enabled'), default=False)
+    start_at = _parse_announcement_datetime(payload.get('start_at'))
+    end_at = _parse_announcement_datetime(payload.get('end_at'))
+    title = str(payload.get('title') or '').strip()
+    message = str(payload.get('message') or '').strip()
+    if not title and not message:
+        return None
+
+    level = str(payload.get('level') or 'info').strip().lower()
+    if level not in {'info', 'success', 'warning', 'danger'}:
+        level = 'info'
+
+    action_type = str(payload.get('action_type') or '').strip().lower()
+    if action_type not in {'', 'url', 'changelog', 'update'}:
+        action_type = ''
+
+    action_url = str(payload.get('action_url') or '').strip()
+    if action_type == 'url' and not action_url:
+        action_type = ''
+
+    action_text = str(payload.get('action_text') or '').strip()
+    if action_type and not action_text:
+        action_text = '查看详情' if action_type == 'url' else '立即查看'
+    if not action_type:
+        action_text = ''
+
+    published_at = _parse_announcement_datetime(payload.get('published_at'))
+    now = get_local_now()
+    if not enabled:
+        status = 'disabled'
+    elif start_at and now < start_at:
+        status = 'scheduled'
+    elif end_at and now > end_at:
+        status = 'expired'
+    else:
+        status = 'active'
+
+    return {
+        'id': _build_announcement_id(payload),
+        'enabled': enabled,
+        'status': status,
+        'level': level,
+        'title': title,
+        'message': message,
+        'action_text': action_text,
+        'action_type': action_type,
+        'action_url': action_url,
+        'dismissible': _coerce_announcement_bool(payload.get('dismissible'), default=True),
+        'published_at': published_at.isoformat() if published_at else '',
+        'start_at': start_at.isoformat() if start_at else '',
+        'end_at': end_at.isoformat() if end_at else '',
+    }
+
+
+def _normalize_dashboard_announcement_snapshot(payload: Any) -> Optional[Dict[str, Any]]:
+    announcements_payload = payload if isinstance(payload, list) else payload.get('announcements') if isinstance(payload, dict) else None
+    if not isinstance(announcements_payload, list):
+        return None
+
+    history: List[Dict[str, Any]] = []
+    for item in announcements_payload:
+        normalized_item = _normalize_dashboard_announcement_entry(item)
+        if normalized_item:
+            history.append(normalized_item)
+
+    history.sort(
+        key=lambda item: item.get('published_at') or item.get('start_at') or item.get('end_at') or '',
+        reverse=True,
+    )
+
+    current_id = ''
+    for item in history:
+        if item.get('status') == 'active':
+            current_id = str(item.get('id') or '').strip()
+            break
+
+    normalized_history: List[Dict[str, Any]] = []
+    current_announcement: Optional[Dict[str, Any]] = None
+    for item in history:
+        normalized_item = dict(item)
+        normalized_item['is_current'] = bool(current_id and normalized_item.get('id') == current_id)
+        normalized_history.append(normalized_item)
+        if normalized_item['is_current'] and current_announcement is None:
+            current_announcement = dict(normalized_item)
+
+    return {
+        'current': current_announcement,
+        'history': normalized_history,
+    }
+
+
+def _try_load_dashboard_announcement_snapshot_from_remote() -> Tuple[bool, Optional[Dict[str, Any]]]:
+    remote_url = _get_announcement_remote_url()
+    try:
+        request = urllib_request.Request(
+            remote_url,
+            headers={
+                'User-Agent': 'XianyuDashboardAnnouncement/1.0',
+                'Accept': 'application/json',
+            }
+        )
+        with urllib_request.urlopen(request, timeout=8) as response:
+            status_code = getattr(response, 'status', 200)
+            if status_code != 200:
+                logger.warning(f"获取远端公告失败: http_status={status_code}, url={remote_url}")
+                return False, None
+            raw_content = response.read().decode('utf-8')
+    except urllib_error.HTTPError as exc:
+        logger.warning(f"获取远端公告失败: http_status={exc.code}, url={remote_url}")
+        return False, None
+    except Exception as exc:
+        logger.warning(f"获取远端公告异常: url={remote_url}, error={mask_sensitive_text(exc)}")
+        return False, None
+
+    try:
+        payload = json.loads(raw_content)
+    except json.JSONDecodeError as exc:
+        logger.warning(f"解析远端公告失败: url={remote_url}, error={exc}")
+        return False, None
+
+    snapshot = _normalize_dashboard_announcement_snapshot(payload)
+    if snapshot is None:
+        logger.warning(f"远端公告格式无效: url={remote_url}")
+        return False, None
+
+    return True, snapshot
+
+
+def _try_load_dashboard_announcement_snapshot_from_local() -> Optional[Dict[str, Any]]:
+    local_path = _get_announcement_local_path()
+    if not local_path.exists():
+        return None
+
+    try:
+        payload = json.loads(local_path.read_text(encoding='utf-8'))
+    except Exception as exc:
+        logger.warning(f"读取本地公告文件失败: path={local_path}, error={mask_sensitive_text(exc)}")
+        return None
+
+    snapshot = _normalize_dashboard_announcement_snapshot(payload)
+    if snapshot is None:
+        logger.warning(f"本地公告格式无效: path={local_path}")
+        return None
+
+    return snapshot
+
+
+def _get_dashboard_announcement_payload(force_refresh: bool = False) -> Dict[str, Any]:
+    now_ts = time.time()
+    if not force_refresh and announcement_cache.get('expires_at', 0) > now_ts:
+        return {
+            'current': announcement_cache.get('current'),
+            'history': list(announcement_cache.get('history') or []),
+        }
+
+    loaded_remote, remote_snapshot = _try_load_dashboard_announcement_snapshot_from_remote()
+    if loaded_remote and remote_snapshot is not None:
+        announcement_cache.update({
+            'expires_at': now_ts + ANNOUNCEMENT_CACHE_TTL_SECONDS,
+            'current': remote_snapshot.get('current'),
+            'history': list(remote_snapshot.get('history') or []),
+            'last_success_current': remote_snapshot.get('current'),
+            'last_success_history': list(remote_snapshot.get('history') or []),
+            'has_remote_success': True,
+        })
+        return remote_snapshot
+
+    if announcement_cache.get('has_remote_success'):
+        snapshot = {
+            'current': announcement_cache.get('last_success_current'),
+            'history': list(announcement_cache.get('last_success_history') or []),
+        }
+    else:
+        snapshot = _try_load_dashboard_announcement_snapshot_from_local() or _empty_dashboard_announcement_snapshot()
+
+    announcement_cache.update({
+        'expires_at': now_ts + ANNOUNCEMENT_CACHE_TTL_SECONDS,
+        'current': snapshot.get('current'),
+        'history': list(snapshot.get('history') or []),
+    })
+    return snapshot
 
 
 def mask_sensitive_text(text: Any) -> str:
@@ -1348,20 +1639,23 @@ async def get_sales_data(
         
         # 构建查询
         placeholders = ','.join(['?'] * len(cookie_ids))
-        query = f"SELECT amount, created_at, order_status FROM orders WHERE cookie_id IN ({placeholders})"
+        query = (
+            f"SELECT amount, {ORDER_SALES_TIME_SQL} AS effective_sales_at, order_status "
+            f"FROM orders WHERE cookie_id IN ({placeholders})"
+        )
         params = list(cookie_ids)
         
         if start_date:
             utc_start = local_date_to_utc_start(start_date)
             if not utc_start:
                 raise HTTPException(status_code=400, detail='开始日期格式错误，应为 YYYY-MM-DD')
-            query += " AND created_at >= ?"
+            query += f" AND {ORDER_SALES_TIME_SQL} >= ?"
             params.append(utc_start)
         if end_date:
             utc_end_exclusive = local_date_to_utc_end_exclusive(end_date)
             if not utc_end_exclusive:
                 raise HTTPException(status_code=400, detail='结束日期格式错误，应为 YYYY-MM-DD')
-            query += " AND created_at < ?"
+            query += f" AND {ORDER_SALES_TIME_SQL} < ?"
             params.append(utc_end_exclusive)
         
         # 执行查询
@@ -1376,7 +1670,7 @@ async def get_sales_data(
 
         for order in orders:
             amount_str = order[0]
-            created_at = order[1]
+            effective_sales_at = order[1]
             order_status = order[2]
 
             if not is_sales_eligible_order_status(order_status):
@@ -1388,7 +1682,7 @@ async def get_sales_data(
                 skipped_invalid_amount += 1
                 continue
 
-            local_date = utc_timestamp_to_local_date_string(created_at)
+            local_date = utc_timestamp_to_local_date_string(effective_sales_at)
             if not local_date:
                 continue
 
@@ -1482,7 +1776,10 @@ async def get_sales_summary(
         # 单次查询获取所有数据，减少数据库访问
         placeholders = ','.join(['?'] * len(cookie_ids))
         month_start_utc = local_date_to_utc_start(month_start_str)
-        query = f"SELECT amount, created_at, order_status FROM orders WHERE created_at >= ? AND cookie_id IN ({placeholders})"
+        query = (
+            f"SELECT amount, {ORDER_SALES_TIME_SQL} AS effective_sales_at, order_status "
+            f"FROM orders WHERE {ORDER_SALES_TIME_SQL} >= ? AND cookie_id IN ({placeholders})"
+        )
         all_orders = db_manager.execute_query(query, [month_start_utc] + cookie_ids)
 
         # 计算销售额
@@ -1494,7 +1791,7 @@ async def get_sales_summary(
 
         for order in all_orders:
             amount_str = order[0]
-            created_at = order[1]
+            effective_sales_at = order[1]
             order_status = order[2]
 
             if not is_sales_eligible_order_status(order_status):
@@ -1506,17 +1803,17 @@ async def get_sales_summary(
                 skipped_invalid_amount += 1
                 continue
 
-            local_created_at = utc_timestamp_to_local_datetime(created_at)
-            if not local_created_at:
+            local_effective_sales_at = utc_timestamp_to_local_datetime(effective_sales_at)
+            if not local_effective_sales_at:
                 continue
 
-            if local_created_at >= month_start:
+            if local_effective_sales_at >= month_start:
                 month_sales += amount
 
-            if local_created_at >= week_start:
+            if local_effective_sales_at >= week_start:
                 week_sales += amount
 
-            if local_created_at >= today_start:
+            if local_effective_sales_at >= today_start:
                 today_sales += amount
 
         logger.info(
@@ -2021,12 +2318,16 @@ async def send_message_api(request: SendMessageRequest):
                 message="账号WebSocket连接未就绪，请等待重连"
             )
 
-        # 发送消息（使用清理后的所有参数）
-        await live_instance.send_msg(
-            live_instance.ws,
-            cleaned_chat_id,
-            cleaned_to_user_id,
-            cleaned_message
+        # 发送消息时需要回到账号实例所属事件循环，避免跨 loop 直接操作 ws
+        await _run_live_instance_on_manager_loop(
+            cleaned_cookie_id,
+            lambda: live_instance.send_msg(
+                live_instance.ws,
+                cleaned_chat_id,
+                cleaned_to_user_id,
+                cleaned_message
+            ),
+            timeout=15,
         )
 
         logger.info(f"API成功发送消息: {cleaned_cookie_id} -> {cleaned_to_user_id}, 内容: {cleaned_message[:50]}{'...' if len(cleaned_message) > 50 else ''}")
@@ -2036,6 +2337,15 @@ async def send_message_api(request: SendMessageRequest):
             message="消息发送成功"
         )
 
+    except HTTPException as e:
+        # 使用清理后的参数记录日志
+        cookie_id_for_log = clean_param(request.cookie_id) if 'clean_param' in locals() else request.cookie_id
+        to_user_id_for_log = clean_param(request.to_user_id) if 'clean_param' in locals() else request.to_user_id
+        logger.warning(f"API发送消息被拒绝: {cookie_id_for_log} -> {to_user_id_for_log}, 原因: {mask_sensitive_text(e.detail)}")
+        return SendMessageResponse(
+            success=False,
+            message=str(e.detail or "发送消息失败，请稍后重试")
+        )
     except Exception as e:
         # 使用清理后的参数记录日志
         cookie_id_for_log = clean_param(request.cookie_id) if 'clean_param' in locals() else request.cookie_id
@@ -2137,6 +2447,399 @@ class SystemSettingCreateIn(BaseModel):
     description: Optional[str] = None
 
 
+def _get_user_cookies_map(current_user: Dict[str, Any]) -> Dict[str, str]:
+    user_id = current_user['user_id']
+    return db_manager.get_all_cookies(user_id)
+
+
+def _ensure_cookie_access(cid: str, current_user: Dict[str, Any]) -> str:
+    cleaned_cid = str(cid or '').strip()
+    if not cleaned_cid:
+        raise HTTPException(status_code=400, detail="缺少Cookie ID")
+
+    user_cookies = _get_user_cookies_map(current_user)
+    if cleaned_cid not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+    return cleaned_cid
+
+
+def _normalize_runtime_timestamp(value: Any) -> Optional[float]:
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    return timestamp if timestamp > 0 else None
+
+
+def _format_runtime_timestamp(value: Any) -> Optional[str]:
+    timestamp = _normalize_runtime_timestamp(value)
+    if timestamp is None:
+        return None
+
+    return datetime.fromtimestamp(timestamp, tz=LOCAL_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _get_runtime_age_seconds(value: Any) -> Optional[int]:
+    timestamp = _normalize_runtime_timestamp(value)
+    if timestamp is None:
+        return None
+    return max(0, int(time.time() - timestamp))
+
+
+def _is_runtime_timestamp_recent(value: Any, window_seconds: Any) -> bool:
+    timestamp = _normalize_runtime_timestamp(value)
+    if timestamp is None:
+        return False
+
+    try:
+        window = max(1, int(float(window_seconds)))
+    except (TypeError, ValueError):
+        return False
+
+    return (time.time() - timestamp) <= window
+
+
+def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
+    cleaned_cid = str(cookie_id or '').strip()
+    runtime_status = {
+        'instance_exists': False,
+        'running': False,
+        'connection_state': 'not_running',
+        'ws_ready': False,
+        'session_ready': False,
+        'has_current_token': False,
+        'message_stream_ready': False,
+        'message_stream_status': 'not_running',
+        'message_stream_note': None,
+        'token_refresh_status': None,
+        'token_refresh_error_message': None,
+        'token_last_refreshed_at': None,
+        'token_last_refreshed_at_display': None,
+        'token_age_seconds': None,
+        'token_cached': False,
+        'session_keepalive_status': None,
+        'session_keepalive_display_status': None,
+        'session_keepalive_display_note': None,
+        'session_keepalive_error_message': None,
+        'session_keepalive_at': None,
+        'session_keepalive_at_display': None,
+        'session_keepalive_age_seconds': None,
+        'session_transport_ready': False,
+        'last_heartbeat_response_at': None,
+        'last_heartbeat_response_at_display': None,
+        'last_heartbeat_age_seconds': None,
+        'last_heartbeat_sent_at': None,
+        'last_heartbeat_sent_at_display': None,
+        'last_heartbeat_sent_age_seconds': None,
+        'ws_transport_ready': False,
+        'last_business_activity_at': None,
+        'last_business_activity_at_display': None,
+        'last_business_activity_age_seconds': None,
+        'last_sync_package_at': None,
+        'last_sync_package_at_display': None,
+        'last_sync_package_age_seconds': None,
+        'last_user_chat_at': None,
+        'last_user_chat_at_display': None,
+        'last_user_chat_age_seconds': None,
+        'last_stream_watchdog_reconnect_at': None,
+        'last_stream_watchdog_reconnect_at_display': None,
+        'last_stream_watchdog_reconnect_age_seconds': None,
+        'last_message_received_at': None,
+        'last_message_received_at_display': None,
+        'last_message_age_seconds': None,
+        'last_successful_connection_at': None,
+        'last_successful_connection_at_display': None,
+        'state_last_changed_at': None,
+        'state_last_changed_at_display': None,
+        'cookie_refresh_enabled': None,
+        'manual_refresh_active': False,
+    }
+    if not cleaned_cid:
+        return runtime_status
+
+    live_instance = None
+    try:
+        if cookie_manager.manager:
+            live_instance = getattr(cookie_manager.manager, 'live_instances', {}).get(cleaned_cid)
+    except Exception:
+        live_instance = None
+
+    try:
+        from XianyuAutoAsync import XianyuLive
+    except Exception as e:
+        if not live_instance:
+            runtime_status['error'] = f"import_failed: {mask_sensitive_text(e)}"
+            return runtime_status
+    else:
+        if not live_instance:
+            live_instance = XianyuLive.get_instance(cleaned_cid)
+
+    if not live_instance:
+        return runtime_status
+
+    connection_state = getattr(live_instance, 'connection_state', None)
+    connection_state_value = getattr(connection_state, 'value', str(connection_state or 'unknown'))
+    ws = getattr(live_instance, 'ws', None)
+    session = getattr(live_instance, 'session', None)
+    ws_transport_ready = bool(ws and not getattr(ws, 'closed', False))
+    session_transport_ready = bool(session and not getattr(session, 'closed', True))
+    token_cached = bool(getattr(live_instance, 'current_token', None))
+    token_refresh_status = getattr(live_instance, 'last_token_refresh_status', None)
+    session_keepalive_status = getattr(live_instance, 'last_session_keepalive_status', None)
+    heartbeat_response_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_heartbeat_response', 0))
+    heartbeat_sent_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_heartbeat_time', 0))
+    token_refreshed_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_token_refresh_time', 0))
+    session_keepalive_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_session_keepalive_time', 0))
+    last_non_heartbeat_message_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_non_heartbeat_message_time', 0))
+    last_sync_package_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_sync_package_time', 0))
+    last_user_chat_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_user_chat_time', 0))
+    last_stream_watchdog_reconnect_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_stream_watchdog_reconnect_time', 0))
+    last_message_received_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_message_received_time', 0))
+    last_successful_connection_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_successful_connection', 0))
+    last_state_changed_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_state_change_time', 0))
+
+    heartbeat_interval = max(1, int(getattr(live_instance, 'heartbeat_interval', 15) or 15))
+    heartbeat_timeout = max(1, int(getattr(live_instance, 'heartbeat_timeout', 30) or 30))
+    token_refresh_interval = max(60, int(getattr(live_instance, 'token_refresh_interval', 72000) or 72000))
+    token_retry_interval = max(30, int(getattr(live_instance, 'token_retry_interval', 180) or 180))
+    session_keepalive_interval = max(60, int(getattr(live_instance, 'session_keepalive_interval', 600) or 600))
+    session_keepalive_retry_interval = max(30, int(getattr(live_instance, 'session_keepalive_retry_interval', 180) or 180))
+    stream_watchdog_grace_period = max(30, int(getattr(live_instance, 'stream_watchdog_grace_period', heartbeat_interval * 4) or heartbeat_interval * 4))
+    message_stream_watchdog_timeout = max(60, int(getattr(live_instance, 'message_stream_watchdog_timeout', session_keepalive_interval * 3) or session_keepalive_interval * 3))
+
+    ws_ready_window = max(heartbeat_timeout * 2, heartbeat_interval * 3, 45)
+    recent_connection_window = max(heartbeat_interval + 5, 20)
+    session_ready_window = max(session_keepalive_interval + session_keepalive_retry_interval + 30, 180)
+    token_ready_window = max(token_refresh_interval + token_retry_interval, 300)
+    now = time.time()
+
+    recent_connection = _is_runtime_timestamp_recent(last_successful_connection_at, recent_connection_window)
+    recent_heartbeat_ok = _is_runtime_timestamp_recent(heartbeat_response_at, ws_ready_window)
+    recent_session_success = (
+        session_keepalive_status == 'success'
+        and _is_runtime_timestamp_recent(session_keepalive_at, session_ready_window)
+    )
+    recent_token_success = (
+        token_refresh_status == 'success'
+        and _is_runtime_timestamp_recent(token_refreshed_at, token_ready_window)
+    )
+
+    token_explicit_failure_statuses = {
+        'captcha_max_retries_exceeded',
+        'token_expired_recovery_failed',
+        'token_refresh_failed',
+        'token_refresh_exception',
+        'token_init_failed',
+    }
+    session_display_status = session_keepalive_status
+    session_display_note = None
+    if (
+        session_keepalive_status in {'auth_failed', 'api_failed', 'network_failed', 'response_parse_failed', 'exception'}
+        and recent_token_success
+        and session_transport_ready
+    ):
+        session_display_status = 'recovered'
+        session_display_note = '轻保活最近一次失败，但已由后续 Token 恢复流程兜底恢复'
+
+    ws_ready = (
+        connection_state_value == 'connected'
+        and ws_transport_ready
+        and (recent_heartbeat_ok or recent_connection)
+    )
+    session_ready = (
+        session_transport_ready
+        and (
+            recent_session_success
+            or recent_token_success
+        )
+    )
+    token_ready = (
+        token_cached
+        and token_refresh_status not in token_explicit_failure_statuses
+        and (
+            recent_token_success
+            or (ws_ready and token_refresh_status in (None, 'success', 'started'))
+            or (
+                token_refresh_status is None
+                and _is_runtime_timestamp_recent(token_refreshed_at, token_ready_window)
+            )
+        )
+    )
+
+    actual_business_activity_at = None
+    if last_non_heartbeat_message_at is not None:
+        if last_successful_connection_at is None or last_non_heartbeat_message_at > last_successful_connection_at:
+            actual_business_activity_at = last_non_heartbeat_message_at
+
+    connected_for_seconds = None
+    if last_successful_connection_at is not None:
+        connected_for_seconds = max(0, int(now - last_successful_connection_at))
+
+    business_idle_reference = actual_business_activity_at or last_successful_connection_at
+    business_idle_seconds = None
+    if business_idle_reference is not None:
+        business_idle_seconds = max(0, int(now - business_idle_reference))
+
+    recent_watchdog_reconnect = _is_runtime_timestamp_recent(
+        last_stream_watchdog_reconnect_at,
+        message_stream_watchdog_timeout,
+    )
+    stream_stale_now = bool(
+        ws_ready
+        and recent_heartbeat_ok
+        and connected_for_seconds is not None
+        and connected_for_seconds >= stream_watchdog_grace_period
+        and business_idle_seconds is not None
+        and business_idle_seconds >= message_stream_watchdog_timeout
+    )
+
+    if connection_state_value in {'connecting', 'reconnecting'}:
+        message_stream_status = 'recovering'
+        message_stream_ready = False
+    elif connection_state_value != 'connected' or not ws_transport_ready:
+        message_stream_status = 'connection_unready'
+        message_stream_ready = False
+    elif stream_stale_now:
+        message_stream_status = 'suspected_stale'
+        message_stream_ready = False
+    else:
+        message_stream_ready = True
+        if connected_for_seconds is not None and connected_for_seconds < stream_watchdog_grace_period and actual_business_activity_at is None:
+            message_stream_status = 'warming_up'
+        elif (
+            recent_watchdog_reconnect
+            and actual_business_activity_at is not None
+            and last_stream_watchdog_reconnect_at is not None
+            and actual_business_activity_at > last_stream_watchdog_reconnect_at
+        ):
+            message_stream_status = 'recovered'
+        elif actual_business_activity_at is not None:
+            message_stream_status = 'healthy'
+        else:
+            message_stream_status = 'watching'
+
+    business_note = (
+        f"最近非心跳业务包：{_format_runtime_timestamp(actual_business_activity_at)}"
+        if actual_business_activity_at is not None else
+        "当前连接尚未收到非心跳业务包"
+    )
+    sync_note = (
+        f"最近同步包：{_format_runtime_timestamp(last_sync_package_at)}"
+        if last_sync_package_at is not None else
+        "当前连接尚未收到同步包"
+    )
+    user_chat_note = (
+        f"最近真实买家消息：{_format_runtime_timestamp(last_user_chat_at)}"
+        if last_user_chat_at is not None else
+        "当前连接尚未收到真实买家消息"
+    )
+    message_stream_note_parts = [business_note]
+    if message_stream_status == 'suspected_stale':
+        message_stream_note_parts.extend([sync_note, user_chat_note])
+    elif recent_watchdog_reconnect and last_stream_watchdog_reconnect_at is not None:
+        message_stream_note_parts.append(
+            f"最近一次假在线重连：{_format_runtime_timestamp(last_stream_watchdog_reconnect_at)}"
+        )
+        if actual_business_activity_at is None:
+            message_stream_note_parts.append(sync_note)
+    else:
+        message_stream_note_parts.append(sync_note)
+    message_stream_note = ' · '.join(message_stream_note_parts)
+
+    runtime_status.update({
+        'instance_exists': True,
+        'running': True,
+        'connection_state': connection_state_value,
+        'ws_ready': ws_ready,
+        'session_ready': session_ready,
+        'has_current_token': token_ready,
+        'message_stream_ready': message_stream_ready,
+        'message_stream_status': message_stream_status,
+        'message_stream_note': message_stream_note,
+        'token_cached': token_cached,
+        'token_refresh_status': token_refresh_status,
+        'token_refresh_error_message': getattr(live_instance, 'last_token_refresh_error_message', None),
+        'token_last_refreshed_at': token_refreshed_at,
+        'token_last_refreshed_at_display': _format_runtime_timestamp(token_refreshed_at),
+        'token_age_seconds': _get_runtime_age_seconds(token_refreshed_at),
+        'session_keepalive_status': session_keepalive_status,
+        'session_keepalive_display_status': session_display_status,
+        'session_keepalive_display_note': session_display_note,
+        'session_keepalive_error_message': getattr(live_instance, 'last_session_keepalive_error_message', None),
+        'session_keepalive_at': session_keepalive_at,
+        'session_keepalive_at_display': _format_runtime_timestamp(session_keepalive_at),
+        'session_keepalive_age_seconds': _get_runtime_age_seconds(session_keepalive_at),
+        'session_transport_ready': session_transport_ready,
+        'last_heartbeat_response_at': heartbeat_response_at,
+        'last_heartbeat_response_at_display': _format_runtime_timestamp(heartbeat_response_at),
+        'last_heartbeat_age_seconds': _get_runtime_age_seconds(heartbeat_response_at),
+        'last_heartbeat_sent_at': heartbeat_sent_at,
+        'last_heartbeat_sent_at_display': _format_runtime_timestamp(heartbeat_sent_at),
+        'last_heartbeat_sent_age_seconds': _get_runtime_age_seconds(heartbeat_sent_at),
+        'ws_transport_ready': ws_transport_ready,
+        'last_business_activity_at': actual_business_activity_at,
+        'last_business_activity_at_display': _format_runtime_timestamp(actual_business_activity_at),
+        'last_business_activity_age_seconds': _get_runtime_age_seconds(actual_business_activity_at),
+        'last_sync_package_at': last_sync_package_at,
+        'last_sync_package_at_display': _format_runtime_timestamp(last_sync_package_at),
+        'last_sync_package_age_seconds': _get_runtime_age_seconds(last_sync_package_at),
+        'last_user_chat_at': last_user_chat_at,
+        'last_user_chat_at_display': _format_runtime_timestamp(last_user_chat_at),
+        'last_user_chat_age_seconds': _get_runtime_age_seconds(last_user_chat_at),
+        'last_stream_watchdog_reconnect_at': last_stream_watchdog_reconnect_at,
+        'last_stream_watchdog_reconnect_at_display': _format_runtime_timestamp(last_stream_watchdog_reconnect_at),
+        'last_stream_watchdog_reconnect_age_seconds': _get_runtime_age_seconds(last_stream_watchdog_reconnect_at),
+        'last_message_received_at': last_message_received_at,
+        'last_message_received_at_display': _format_runtime_timestamp(last_message_received_at),
+        'last_message_age_seconds': _get_runtime_age_seconds(last_message_received_at),
+        'last_successful_connection_at': last_successful_connection_at,
+        'last_successful_connection_at_display': _format_runtime_timestamp(last_successful_connection_at),
+        'state_last_changed_at': last_state_changed_at,
+        'state_last_changed_at_display': _format_runtime_timestamp(last_state_changed_at),
+        'cookie_refresh_enabled': getattr(live_instance, 'cookie_refresh_enabled', None),
+        'manual_refresh_active': bool(XianyuLive.is_manual_refresh_active(cleaned_cid, allow_handoff_recovery=True)),
+    })
+    return runtime_status
+
+
+async def _run_live_instance_on_manager_loop(
+    cookie_id: str,
+    coroutine_factory: Callable[[], Awaitable[Any]],
+    *,
+    timeout: Optional[float] = None,
+) -> Any:
+    """将运行中账号实例的协程调度回 CookieManager 所属事件循环执行。"""
+    manager = getattr(cookie_manager, 'manager', None)
+    target_loop = getattr(manager, 'loop', None)
+    if not target_loop:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+
+    if hasattr(target_loop, 'is_closed') and target_loop.is_closed():
+        raise HTTPException(status_code=500, detail="账号事件循环已关闭")
+
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if current_loop is target_loop:
+        return await coroutine_factory()
+
+    if not target_loop.is_running():
+        raise HTTPException(status_code=500, detail="账号事件循环未运行")
+
+    thread_future = asyncio.run_coroutine_threadsafe(coroutine_factory(), target_loop)
+    wrapped_future = asyncio.wrap_future(thread_future)
+
+    try:
+        if timeout and timeout > 0:
+            return await asyncio.wait_for(wrapped_future, timeout=timeout)
+        return await wrapped_future
+    except asyncio.TimeoutError:
+        thread_future.cancel()
+        raise HTTPException(status_code=504, detail="账号处理超时，请稍后重试")
+
+
 
 
 
@@ -2158,10 +2861,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
     if cookie_manager.manager is None:
         return []
 
-    # 获取当前用户的cookies
-    user_id = current_user['user_id']
-    from db_manager import db_manager
-    user_cookies = db_manager.get_all_cookies(user_id)
+    user_cookies = _get_user_cookies_map(current_user)
 
     result = []
     for cookie_id, cookie_value in user_cookies.items():
@@ -2171,6 +2871,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
+        status_note = cookie_details.get('status_note', '') if cookie_details else ''
         username = cookie_details.get('username', '') if cookie_details else ''
         has_password = bool(cookie_details.get('password')) if cookie_details else False
 
@@ -2182,11 +2883,38 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'auto_confirm': auto_confirm,
             'auto_comment': auto_comment,
             'remark': remark,
+            'status_note': status_note,
             'username': username,
             'has_password': has_password,
-            'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10
+            'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
+            'runtime_status': _build_live_runtime_status(cookie_id),
         })
     return result
+
+
+@app.get("/api/announcement")
+def get_dashboard_announcement(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取仪表盘公告，优先读取 GitHub 公告文件，本地文件兜底。"""
+    try:
+        _ = current_user['user_id']
+        snapshot = _get_dashboard_announcement_payload()
+        return {
+            'success': True,
+            'announcement': snapshot.get('current'),
+            'current': snapshot.get('current'),
+            'history': snapshot.get('history') or [],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取仪表盘公告失败: {mask_sensitive_text(e)}")
+        return {
+            'success': False,
+            'announcement': None,
+            'current': None,
+            'history': [],
+            'message': safe_client_error("获取公告失败，请稍后重试"),
+        }
 
 
 @app.post("/cookies")
@@ -2318,19 +3046,15 @@ def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: 
 def get_cookie_account_details(cid: str, include_secrets: bool = False, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取账号详细信息（包括用户名、密码、显示浏览器设置）"""
     try:
-        # 检查cookie是否属于当前用户
-        user_id = current_user['user_id']
-        from db_manager import db_manager
-        user_cookies = db_manager.get_all_cookies(user_id)
-
-        if cid not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        cid = _ensure_cookie_access(cid, current_user)
 
         # 获取详细信息
         details = db_manager.get_cookie_details(cid)
         
         if not details:
             raise HTTPException(status_code=404, detail="账号不存在")
+
+        runtime_status = _build_live_runtime_status(cid)
 
         if not include_secrets:
             details = {
@@ -2341,6 +3065,12 @@ def get_cookie_account_details(cid: str, include_secrets: bool = False, current_
                 'has_cookie_value': bool(details.get('value')),
                 'has_password': bool(details.get('password')),
                 'has_proxy_pass': bool(details.get('proxy_pass')),
+                'runtime_status': runtime_status,
+            }
+        else:
+            details = {
+                **details,
+                'runtime_status': runtime_status,
             }
         
         return details
@@ -2349,6 +3079,103 @@ def get_cookie_account_details(cid: str, include_secrets: bool = False, current_
     except Exception as e:
         logger.error(f"获取账号详情失败: {mask_sensitive_text(e)}")
         raise HTTPException(status_code=400, detail=safe_client_error("获取账号详情失败，请稍后重试"))
+
+
+@app.get("/cookies/{cid}/runtime-status")
+def get_cookie_runtime_status(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取账号运行态状态，便于排查保活/连接问题。"""
+    try:
+        cid = _ensure_cookie_access(cid, current_user)
+        return {
+            'cookie_id': cid,
+            'runtime_status': _build_live_runtime_status(cid),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取账号运行态失败: {cid} - {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("获取账号运行态失败，请稍后重试"))
+
+
+@app.get("/cookies/{cid}/conversations/{conversation_id}/history")
+async def get_conversation_history(
+    cid: str,
+    conversation_id: str,
+    page_size: int = 20,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """获取指定会话的历史消息。"""
+    try:
+        cid = _ensure_cookie_access(cid, current_user)
+        normalized_conversation_id = str(conversation_id or '').strip().split('@')[0]
+        if not normalized_conversation_id:
+            raise HTTPException(status_code=400, detail="缺少会话ID")
+
+        normalized_page_size = max(1, min(int(page_size or 20), 100))
+
+        from XianyuAutoAsync import XianyuLive
+        live_instance = XianyuLive.get_instance(cid)
+        if not live_instance:
+            raise HTTPException(status_code=400, detail="账号未启动，暂无法查询历史消息")
+
+        log_with_user(
+            'info',
+            f"开始查询账号 {cid} 会话 {normalized_conversation_id} 的历史消息，page_size={normalized_page_size}",
+            current_user
+        )
+        history_messages = await _run_live_instance_on_manager_loop(
+            cid,
+            lambda: live_instance.list_all_conversations(
+                normalized_conversation_id,
+                page_size=normalized_page_size,
+            ),
+            timeout=60,
+        )
+        return {
+            'success': True,
+            'cookie_id': cid,
+            'conversation_id': normalized_conversation_id,
+            'page_size': normalized_page_size,
+            'count': len(history_messages),
+            'messages': history_messages,
+            'runtime_status': _build_live_runtime_status(cid),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取历史消息失败: {cid}/{conversation_id} - {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("获取历史消息失败，请稍后重试"))
+
+
+@app.post("/cookies/{cid}/session-keepalive")
+async def trigger_session_keepalive(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """手动触发一次轻量会话保活。"""
+    try:
+        cid = _ensure_cookie_access(cid, current_user)
+
+        from XianyuAutoAsync import XianyuLive
+        live_instance = XianyuLive.get_instance(cid)
+        if not live_instance:
+            raise HTTPException(status_code=400, detail="账号未启动，暂无法执行轻量保活")
+
+        log_with_user('info', f"手动触发账号 {cid} 的轻量会话保活", current_user)
+        keepalive_ok = await _run_live_instance_on_manager_loop(
+            cid,
+            lambda: live_instance.keep_session_alive(),
+            timeout=40,
+        )
+        runtime_status = _build_live_runtime_status(cid)
+        return {
+            'success': keepalive_ok,
+            'cookie_id': cid,
+            'message': '轻量会话保活成功' if keepalive_ok else '轻量会话保活失败',
+            'runtime_status': runtime_status,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"手动轻量保活失败: {cid} - {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("手动轻量保活失败，请稍后重试"))
 
 
 # ========================= 代理配置相关接口 =========================
@@ -2545,7 +3372,11 @@ def _empty_slider_session_stats() -> Dict[str, Any]:
         'recent_success': None,
         'recent_failure': None,
         'accounts_with_sessions': 0,
+        'accounts_with_failures': 0,
         'stats_mode': 'session',
+        'summary_text': '暂无滑块验证记录',
+        'selected_range': 'all',
+        'range_label': '所有',
     }
 
 async def _execute_password_login(session_id: str, account_id: str, account: str, password: str, show_browser: bool, user_id: int, current_user: Dict[str, Any]):
@@ -2588,19 +3419,31 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
         # 更新会话信息
         password_login_sessions[session_id]['slider_instance'] = slider_instance
         
-        # 定义通知回调函数，用于检测到人脸认证时返回验证链接或截图（同步函数）
-        def notification_callback(message: str, screenshot_path: str = None, verification_url: str = None, screenshot_path_new: str = None):
-            """人脸认证通知回调（同步）
+        # 定义通知回调函数，用于检测到验证时返回验证链接或截图（同步函数）
+        def notification_callback(
+            message: str,
+            screenshot_path: str = None,
+            verification_url: str = None,
+            screenshot_path_new: str = None,
+            verification_type: str = None,
+        ):
+            """账号验证通知回调（同步）
             
             Args:
                 message: 通知消息
                 screenshot_path: 旧版截图路径（兼容参数）
                 verification_url: 验证链接
                 screenshot_path_new: 新版截图路径（新参数，优先使用）
+                verification_type: 验证类型
             """
             try:
                 # 优先使用新的截图路径参数
                 actual_screenshot_path = screenshot_path_new if screenshot_path_new else screenshot_path
+                verification_type_label = resolve_verification_type_label(
+                    verification_type,
+                    message,
+                    verification_url,
+                )
                 
                 # 优先使用截图路径，如果没有截图则使用验证链接
                 if actual_screenshot_path and os.path.exists(actual_screenshot_path):
@@ -2610,56 +3453,37 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                         'verification_required',
                         screenshot_path=actual_screenshot_path,
                         verification_url=None,
-                        qr_code_url=None
+                        qr_code_url=None,
+                        verification_type=verification_type_label,
                     )
-                    log_with_user('info', f"人脸认证截图已保存: {session_id}, 路径: {actual_screenshot_path}", current_user)
+                    log_with_user('info', f"账号验证截图已保存: {session_id}, 路径: {actual_screenshot_path}", current_user)
                     
                     # 发送通知到用户配置的渠道
                     def send_face_verification_notification():
-                        """在后台线程中发送人脸验证通知"""
+                        """在后台线程中发送账号验证通知"""
                         try:
-                            from XianyuAutoAsync import XianyuLive
-                            log_with_user('info', f"开始尝试发送人脸验证通知: {account_id}", current_user)
-                            
-                            # 尝试获取XianyuLive实例（如果账号已经存在）
-                            live_instance = XianyuLive.get_instance(account_id)
-                            
-                            if live_instance:
-                                log_with_user('info', f"找到账号实例，准备发送通知: {account_id}", current_user)
-                                # 创建新的事件循环来运行异步通知
-                                new_loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(new_loop)
-                                try:
-                                    new_loop.run_until_complete(
-                                        live_instance.send_token_refresh_notification(
-                                            error_message=message,
-                                            notification_type="face_verification",
-                                            verification_url=None,
-                                            attachment_path=actual_screenshot_path
-                                        )
-                                    )
-                                    log_with_user('info', f"✅ 已发送人脸验证通知: {account_id}", current_user)
-                                except Exception as notify_err:
-                                    log_with_user('error', f"发送人脸验证通知失败: {str(notify_err)}", current_user)
-                                    import traceback
-                                    log_with_user('error', f"通知错误详情: {traceback.format_exc()}", current_user)
-                                finally:
-                                    new_loop.close()
+                            log_with_user('info', f"开始尝试发送账号验证通知: {account_id}", current_user)
+                            notification_message = build_face_verify_notification(
+                                account_id=account_id,
+                                time_text=time.strftime('%Y-%m-%d %H:%M:%S'),
+                                verification_type=verification_type_label,
+                                verification_url=verification_url or '',
+                                error_message=message,
+                                has_screenshot=True,
+                            )
+                            notification_sent = dispatch_account_notifications_sync(
+                                account_id,
+                                notification_message,
+                                title='闲鱼账号需要验证',
+                                notification_type='face_verification',
+                                attachment_path=actual_screenshot_path,
+                            )
+                            if notification_sent:
+                                log_with_user('info', f"✅ 已发送账号验证通知: {account_id}", current_user)
                             else:
-                                # 如果账号实例不存在，记录警告并尝试从数据库获取通知配置
-                                log_with_user('warning', f"账号实例不存在: {account_id}，尝试从数据库获取通知配置", current_user)
-                                try:
-                                    # 尝试从数据库获取通知配置
-                                    notifications = db_manager.get_account_notifications(account_id)
-                                    if notifications:
-                                        log_with_user('info', f"找到 {len(notifications)} 个通知配置，但需要账号实例才能发送", current_user)
-                                        log_with_user('warning', f"账号实例不存在，无法发送通知: {account_id}。请确保账号已登录并运行中。", current_user)
-                                    else:
-                                        log_with_user('warning', f"账号 {account_id} 未配置通知渠道", current_user)
-                                except Exception as db_err:
-                                    log_with_user('error', f"获取通知配置失败: {str(db_err)}", current_user)
+                                log_with_user('warning', f"账号验证通知未发送成功: {account_id}", current_user)
                         except Exception as notify_err:
-                            log_with_user('error', f"发送人脸验证通知时出错: {str(notify_err)}", current_user)
+                            log_with_user('error', f"发送账号验证通知时出错: {str(notify_err)}", current_user)
                             import traceback
                             log_with_user('error', f"通知错误详情: {traceback.format_exc()}", current_user)
                     
@@ -2668,7 +3492,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     notification_thread = threading.Thread(target=send_face_verification_notification)
                     notification_thread.daemon = True
                     notification_thread.start()
-                    log_with_user('info', f"已启动人脸验证通知发送线程: {account_id}", current_user)
+                    log_with_user('info', f"已启动账号验证通知发送线程: {account_id}", current_user)
                 elif verification_url:
                     # 如果没有截图，使用验证链接（兼容旧版本）
                     _set_password_login_session_status(
@@ -2676,55 +3500,36 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                         'verification_required',
                         verification_url=verification_url,
                         screenshot_path=None,
-                        qr_code_url=None
+                        qr_code_url=None,
+                        verification_type=verification_type_label,
                     )
-                    log_with_user('info', f"人脸认证验证链接已保存: {session_id}, URL: {verification_url}", current_user)
+                    log_with_user('info', f"账号验证链接已保存: {session_id}, URL: {verification_url}", current_user)
                     
                     # 发送通知到用户配置的渠道
                     def send_face_verification_notification():
-                        """在后台线程中发送人脸验证通知"""
+                        """在后台线程中发送账号验证通知"""
                         try:
-                            from XianyuAutoAsync import XianyuLive
-                            log_with_user('info', f"开始尝试发送人脸验证通知: {account_id}", current_user)
-                            
-                            # 尝试获取XianyuLive实例（如果账号已经存在）
-                            live_instance = XianyuLive.get_instance(account_id)
-                            
-                            if live_instance:
-                                log_with_user('info', f"找到账号实例，准备发送通知: {account_id}", current_user)
-                                # 创建新的事件循环来运行异步通知
-                                new_loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(new_loop)
-                                try:
-                                    new_loop.run_until_complete(
-                                        live_instance.send_token_refresh_notification(
-                                            error_message=message,
-                                            notification_type="face_verification",
-                                            verification_url=verification_url
-                                        )
-                                    )
-                                    log_with_user('info', f"✅ 已发送人脸验证通知: {account_id}", current_user)
-                                except Exception as notify_err:
-                                    log_with_user('error', f"发送人脸验证通知失败: {str(notify_err)}", current_user)
-                                    import traceback
-                                    log_with_user('error', f"通知错误详情: {traceback.format_exc()}", current_user)
-                                finally:
-                                    new_loop.close()
+                            log_with_user('info', f"开始尝试发送账号验证通知: {account_id}", current_user)
+                            notification_message = build_face_verify_notification(
+                                account_id=account_id,
+                                time_text=time.strftime('%Y-%m-%d %H:%M:%S'),
+                                verification_type=verification_type_label,
+                                verification_url=verification_url or '无',
+                                error_message=message,
+                                has_screenshot=False,
+                            )
+                            notification_sent = dispatch_account_notifications_sync(
+                                account_id,
+                                notification_message,
+                                title='闲鱼账号需要验证',
+                                notification_type='face_verification',
+                            )
+                            if notification_sent:
+                                log_with_user('info', f"✅ 已发送账号验证通知: {account_id}", current_user)
                             else:
-                                # 如果账号实例不存在，记录警告并尝试从数据库获取通知配置
-                                log_with_user('warning', f"账号实例不存在: {account_id}，尝试从数据库获取通知配置", current_user)
-                                try:
-                                    # 尝试从数据库获取通知配置
-                                    notifications = db_manager.get_account_notifications(account_id)
-                                    if notifications:
-                                        log_with_user('info', f"找到 {len(notifications)} 个通知配置，但需要账号实例才能发送", current_user)
-                                        log_with_user('warning', f"账号实例不存在，无法发送通知: {account_id}。请确保账号已登录并运行中。", current_user)
-                                    else:
-                                        log_with_user('warning', f"账号 {account_id} 未配置通知渠道", current_user)
-                                except Exception as db_err:
-                                    log_with_user('error', f"获取通知配置失败: {str(db_err)}", current_user)
+                                log_with_user('warning', f"账号验证通知未发送成功: {account_id}", current_user)
                         except Exception as notify_err:
-                            log_with_user('error', f"发送人脸验证通知时出错: {str(notify_err)}", current_user)
+                            log_with_user('error', f"发送账号验证通知时出错: {str(notify_err)}", current_user)
                             import traceback
                             log_with_user('error', f"通知错误详情: {traceback.format_exc()}", current_user)
                     
@@ -2733,15 +3538,17 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     notification_thread = threading.Thread(target=send_face_verification_notification)
                     notification_thread.daemon = True
                     notification_thread.start()
-                    log_with_user('info', f"已启动人脸验证通知发送线程: {account_id}", current_user)
+                    log_with_user('info', f"已启动账号验证通知发送线程: {account_id}", current_user)
             except Exception as e:
-                log_with_user('error', f"处理人脸认证通知失败: {str(e)}", current_user)
+                log_with_user('error', f"处理账号验证通知失败: {str(e)}", current_user)
         
         # 调用登录方法（同步方法，需要在后台线程中执行）
         import threading
 
         def run_login():
+            import asyncio  # 在函数开头导入，避免后续局部import导致UnboundLocalError
             from db_manager import db_manager  # 在函数开头导入，避免作用域问题
+            from XianyuAutoAsync import XianyuLive
             try:
                 cookies_dict = slider_instance.login_with_password_playwright(
                     account=account,
@@ -2759,14 +3566,87 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     _update_session_risk_log(session_id, 'failed', error_message=failure_message[:200])
                     return
                 
-                # 将cookie字典转换为字符串格式
-                cookies_str = '; '.join([f"{k}={v}" for k, v in cookies_dict.items()])
-                
                 log_with_user('info', f"账号密码登录成功，获取到 {len(cookies_dict)} 个Cookie字段: {account_id}", current_user)
                 
                 # 检查是否已存在相同账号ID的Cookie
                 existing_cookies = db_manager.get_all_cookies(user_id)
                 is_new_account = account_id not in existing_cookies
+                existing_cookie_value = existing_cookies.get(account_id, '') if not is_new_account else ''
+                existing_cookie_dict = trans_cookies(existing_cookie_value) if existing_cookie_value else {}
+
+                merge_result = XianyuLive.protected_merge_cookie_dicts(existing_cookie_dict, cookies_dict)
+                if merge_result['incoming_missing_protected_fields']:
+                    log_with_user(
+                        'warning',
+                        f"密码登录返回的Cookie快照缺少关键字段，将进行保护性合并: {', '.join(merge_result['incoming_missing_protected_fields'])}",
+                        current_user
+                    )
+                if merge_result['preserved_protected_fields']:
+                    log_with_user(
+                        'warning',
+                        f"密码登录保护性保留旧关键字段: {', '.join(merge_result['preserved_protected_fields'])}",
+                        current_user
+                    )
+                if merge_result['account_switched']:
+                    log_with_user('warning', f"检测到unb变化，按账号切换处理: {account_id}", current_user)
+
+                merged_cookies_dict = merge_result['merged_cookies_dict']
+                log_with_user(
+                    'info',
+                    f"manual_login_protected_merge incoming_count={merge_result.get('incoming_count', len(cookies_dict))} "
+                    f"existing_count={merge_result.get('existing_count', len(existing_cookie_dict))} "
+                    f"merged_count={merge_result.get('merged_count', len(merged_cookies_dict))} "
+                    f"protected_preserved_fields={merge_result.get('preserved_protected_fields') or []} "
+                    f"would_remove_fields={merge_result.get('would_remove_fields') or []} "
+                    f"account_switched={merge_result.get('account_switched', False)}",
+                    current_user
+                )
+                cookies_str = '; '.join([f"{k}={v}" for k, v in merged_cookies_dict.items()])
+
+                if merge_result['missing_required_fields']:
+                    missing_fields_text = ', '.join(merge_result['missing_required_fields'])
+                    error_message = f"登录成功但Cookie核心字段仍缺失，未覆盖旧Cookie: {missing_fields_text}"
+                    log_with_user('error', f"{error_message}: {account_id}", current_user)
+                    _set_password_login_session_status(session_id, 'failed', error=error_message)
+                    _update_session_risk_log(
+                        session_id,
+                        'failed',
+                        error_message=error_message[:200],
+                        result_code='password_login_cookie_incomplete',
+                        event_meta={
+                            'missing_required_fields': merge_result['missing_required_fields'],
+                            'incoming_missing_protected_fields': merge_result['incoming_missing_protected_fields'],
+                            'preserved_protected_fields': merge_result['preserved_protected_fields'],
+                        }
+                    )
+                    return
+
+                if is_refresh_mode:
+                    try:
+                        log_with_user('info', f"刷新模式开始执行Token预检，确认新实例可直接恢复: {account_id}", current_user)
+                        XianyuLive.mark_manual_refresh_handoff(account_id, source=manual_refresh_owner)
+                        temp_xianyu = XianyuLive(
+                            cookies_str=cookies_str,
+                            cookie_id=account_id,
+                            user_id=user_id,
+                            register_instance=False,
+                        )
+                        asyncio.run(temp_xianyu.preflight_token_after_manual_refresh())
+                        cookies_str = temp_xianyu.cookies_str
+                        merged_cookies_dict = trans_cookies(cookies_str)
+                        log_with_user('info', f"刷新模式Token预检通过，将使用预检后的Cookie继续交接: {account_id}", current_user)
+                    except Exception as preflight_err:
+                        error_message = f"刷新模式认证预检失败，任务未切换: {str(preflight_err)}"
+                        log_with_user('error', f"{error_message}: {account_id}", current_user)
+                        _set_password_login_session_status(session_id, 'failed', error=error_message)
+                        _update_session_risk_log(
+                            session_id,
+                            'failed',
+                            error_message=error_message[:200],
+                            result_code='manual_refresh_preflight_failed',
+                            event_meta={'account_id': account_id},
+                        )
+                        return
                 
                 # 保存账号密码和Cookie到数据库
                 # 使用 update_cookie_account_info 来保存，它会自动处理新账号和现有账号的情况
@@ -2833,18 +3713,18 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                 logger.error(traceback.format_exc())
                 
                 if is_refresh_mode:
-                    log_with_user('info', f"刷新模式跳过额外浏览器Cookie刷新，直接使用当前登录结果: {account_id}", current_user)
+                    log_with_user('info', f"刷新模式已完成Token预检，直接切换到通过预检的新Cookie: {account_id}", current_user)
                 else:
                     # 登录成功后，调用_refresh_cookies_via_browser刷新Cookie
                     try:
                         log_with_user('info', f"开始调用_refresh_cookies_via_browser刷新Cookie: {account_id}", current_user)
-                        from XianyuAutoAsync import XianyuLive
                         
                         # 创建临时的XianyuLive实例来刷新Cookie
                         temp_xianyu = XianyuLive(
                             cookies_str=cookies_str,
                             cookie_id=account_id,
-                            user_id=user_id
+                            user_id=user_id,
+                            register_instance=False,
                         )
                         
                         # 重置扫码登录Cookie刷新标志，确保账号密码登录后能立即刷新
@@ -2905,52 +3785,39 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     'success',
                     account_id=account_id,
                     is_new_account=is_new_account,
-                    cookie_count=len(cookies_dict)
+                    cookie_count=len(merged_cookies_dict)
                 )
                 # 更新风控日志状态
-                _update_session_risk_log(session_id, 'success', processing_result='Cookie刷新成功')
+                _update_session_risk_log(
+                    session_id,
+                    'success',
+                    processing_result='Cookie刷新成功，认证预检通过' if is_refresh_mode else 'Cookie刷新成功'
+                )
 
                 # 发送登录成功通知（使用模板系统）
                 try:
-                    from utils.slider_patch import send_notification
-                    from db_manager import db_manager
-
                     # 根据模式选择不同模板
                     notify_refresh_mode = password_login_sessions[session_id].get('refresh_mode')
                     template_type = 'cookie_refresh_success' if notify_refresh_mode else 'password_login_success'
 
-                    # 获取模板
-                    template_data = db_manager.get_notification_template(template_type)
-                    if template_data and template_data.get('template'):
-                        template = template_data['template']
-                    else:
-                        if notify_refresh_mode:
-                            template = '''✅ 刷新Cookie成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号已可正常使用。'''
-                        else:
-                            template = '''✅ 密码登录成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号Cookie已更新，正在重启服务...'''
-
-                    # 格式化模板
-                    notification_message = template.replace('{account_id}', account_id)
-                    notification_message = notification_message.replace('{time}', time.strftime('%Y-%m-%d %H:%M:%S'))
-                    notification_message = notification_message.replace('{cookie_count}', str(len(cookies_dict)))
+                    notification_message = render_notification_template(
+                        template_type,
+                        account_id=account_id,
+                        time=time.strftime('%Y-%m-%d %H:%M:%S'),
+                        cookie_count=str(len(merged_cookies_dict))
+                    )
 
                     login_type = "刷新Cookie" if notify_refresh_mode else "密码登录"
-                    notification_title = f"🎉 {login_type}成功"
-
-                    send_notification(account_id, notification_title, notification_message, "success")
-                    log_with_user('info', f"已发送{login_type}成功通知: {account_id}", current_user)
+                    notification_sent = dispatch_account_notifications_sync(
+                        account_id,
+                        notification_message,
+                        title=f"{login_type}成功",
+                        notification_type=template_type,
+                    )
+                    if notification_sent:
+                        log_with_user('info', f"已发送{login_type}成功通知: {account_id}", current_user)
+                    else:
+                        log_with_user('warning', f"{login_type}成功通知未发送成功: {account_id}", current_user)
                 except Exception as notify_err:
                     log_with_user('warning', f"发送登录成功通知失败: {account_id}, 错误: {str(notify_err)}", current_user)
                 
@@ -3088,6 +3955,7 @@ async def password_login(
             'verification_url': None,
             'screenshot_path': None,
             'qr_code_url': None,
+            'verification_type': None,
             'slider_instance': None,
             'task': None,
             'timestamp': time.time(),
@@ -3146,15 +4014,17 @@ async def check_password_login_status(
         status = session['status']
         
         if status == 'verification_required':
-            # 需要人脸认证
+            # 需要身份验证
             screenshot_path = session.get('screenshot_path')
             verification_url = session.get('verification_url')
+            verification_type = session.get('verification_type') or '身份验证'
             return {
                 'status': 'verification_required',
                 'verification_url': verification_url,
                 'screenshot_path': screenshot_path,
                 'qr_code_url': session.get('qr_code_url'),  # 保留兼容性
-                'message': '需要人脸验证，请查看验证截图' if screenshot_path else '需要人脸验证，请点击验证链接'
+                'verification_type': verification_type,
+                'message': f'需要{verification_type}，请查看验证截图' if screenshot_path else f'需要{verification_type}，请点击验证链接'
             }
         elif status == 'success':
             # 登录成功
@@ -3560,7 +4430,8 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
             temp_instance = XianyuLive(
                 cookies_str=cookies,
                 cookie_id=account_id,
-                user_id=user_id
+                user_id=user_id,
+                register_instance=False,
             )
 
             # 执行cookie刷新获取真实cookie
@@ -3837,7 +4708,8 @@ async def refresh_cookies_from_qr_login(
         temp_instance = XianyuLive(
             cookies_str=qr_cookies,
             cookie_id=cookie_id,
-            user_id=current_user['user_id']
+            user_id=current_user['user_id'],
+            register_instance=False,
         )
 
         # 执行cookie刷新
@@ -4021,7 +4893,13 @@ def update_cookie_status(cid: str, status_data: CookieStatusIn, current_user: Di
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
         cookie_manager.manager.update_cookie_status(cid, status_data.enabled)
-        return {'msg': 'status updated', 'enabled': status_data.enabled}
+        status_note = ''
+        if status_data.enabled:
+            db_manager.update_cookie_status_note(cid, '')
+        else:
+            cookie_details = db_manager.get_cookie_details(cid)
+            status_note = cookie_details.get('status_note', '') if cookie_details else ''
+        return {'msg': 'status updated', 'enabled': status_data.enabled, 'status_note': status_note}
     except HTTPException:
         raise
     except Exception as e:
@@ -4349,7 +5227,7 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
     from db_manager import db_manager
 
     try:
-        if data.template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if data.template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         # 获取所有已启用的通知渠道
@@ -4389,13 +5267,15 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
             },
             'slider_success': {
                 'account_id': '测试账号',
-                'time': time_module.strftime('%Y-%m-%d %H:%M:%S')
+                'time': time_module.strftime('%Y-%m-%d %H:%M:%S'),
+                'status_text': 'cookies已自动更新到数据库'
             },
             'face_verify': {
                 'account_id': '测试账号',
                 'time': time_module.strftime('%Y-%m-%d %H:%M:%S'),
+                'verification_action': '请点击验证链接完成验证:',
                 'verification_url': 'https://passport.goofish.com/mini_login.htm?example=test',
-                'verification_type': '人脸验证'
+                'verification_type': '身份验证'
             },
             'password_login_success': {
                 'account_id': '测试账号',
@@ -4589,7 +5469,7 @@ def get_notification_template(template_type: str, current_user: Dict[str, Any] =
     """获取指定类型的通知模板"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         template = db_manager.get_notification_template(template_type)
@@ -4618,7 +5498,7 @@ def update_notification_template(template_type: str, data: NotificationTemplateI
     """更新通知模板"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         # 如果模板不存在，先插入默认值
@@ -4648,7 +5528,7 @@ def reset_notification_template(template_type: str, current_user: Dict[str, Any]
     """重置通知模板为默认值"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         success = db_manager.reset_notification_template(template_type)
@@ -4669,7 +5549,7 @@ def get_default_notification_template(template_type: str, current_user: Dict[str
     """获取默认通知模板"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         default_template = db_manager.get_default_notification_template(template_type)
@@ -7128,12 +8008,21 @@ async def get_risk_control_logs(
 @app.get("/admin/slider-verification-stats")
 async def get_slider_verification_stats(
     cookie_id: str = None,
+    range_key: str = 'all',
     admin_user: Dict[str, Any] = Depends(require_admin)
 ):
-    """获取当前系统用户下的滑块验证会话统计。"""
+    """获取当前系统用户下的滑块验证统计。"""
     try:
         user_id = admin_user['user_id']
         user_cookie_ids = sorted(db_manager.get_all_cookies(user_id).keys())
+        normalized_range = str(range_key or '').strip().lower()
+        if normalized_range not in {'today', '7d', 'all'}:
+            normalized_range = 'all'
+        range_label = {
+            'today': '当日',
+            '7d': '近 7 天',
+            'all': '所有',
+        }[normalized_range]
 
         if cookie_id:
             if cookie_id not in user_cookie_ids:
@@ -7143,6 +8032,9 @@ async def get_slider_verification_stats(
                         **_empty_slider_session_stats(),
                         'scope_label': cookie_id,
                         'selected_cookie_id': cookie_id,
+                        'selected_range': normalized_range,
+                        'range_label': range_label,
+                        'summary_text': '暂无滑块验证记录' if normalized_range == 'all' else f'{range_label}暂无滑块验证记录',
                     }
                 }
             target_cookie_ids = [cookie_id]
@@ -7151,7 +8043,7 @@ async def get_slider_verification_stats(
             target_cookie_ids = user_cookie_ids
             scope_label = '全部账号'
 
-        stats = db_manager.get_slider_verification_session_stats(target_cookie_ids)
+        stats = db_manager.get_slider_verification_session_stats(target_cookie_ids, range_key=normalized_range)
         stats.update({
             'scope_label': scope_label,
             'selected_cookie_id': cookie_id or '',
@@ -7159,7 +8051,7 @@ async def get_slider_verification_stats(
 
         log_with_user(
             'info',
-            f"获取滑块验证会话统计成功: scope={scope_label}, sessions={stats['total_sessions']}, success_rate={stats['success_rate']}%",
+            f"获取滑块验证统计成功: scope={scope_label}, range={range_label}, sessions={stats['total_sessions']}, success={stats['success_count']}, failure={stats['failure_count']}",
             admin_user,
         )
 
@@ -7168,10 +8060,10 @@ async def get_slider_verification_stats(
             'data': stats,
         }
     except Exception as e:
-        log_with_user('error', f"获取滑块验证会话统计失败: {str(e)}", admin_user)
+        log_with_user('error', f"获取滑块验证统计失败: {str(e)}", admin_user)
         return {
             'success': False,
-            'message': f'获取滑块验证会话统计失败: {str(e)}',
+            'message': f'获取滑块验证统计失败: {str(e)}',
             'data': _empty_slider_session_stats(),
         }
 
@@ -7246,7 +8138,7 @@ async def get_all_items_from_account(request: dict, current_user: Dict[str, Any]
 
         # 创建XianyuLive实例，传入正确的cookie_id
         from XianyuAutoAsync import XianyuLive
-        xianyu_instance = XianyuLive(cookies_str, cookie_id)
+        xianyu_instance = XianyuLive(cookies_str, cookie_id, register_instance=False)
 
         # 调用获取所有商品信息的方法（自动分页）并同步最新商品详情
         logger.info(f"开始同步账号 {cookie_id} 的所有商品信息和最新详情")
@@ -7310,7 +8202,7 @@ async def get_items_by_page(request: dict, current_user: Dict[str, Any] = Depend
 
         # 创建XianyuLive实例，传入正确的cookie_id
         from XianyuAutoAsync import XianyuLive
-        xianyu_instance = XianyuLive(cookies_str, cookie_id)
+        xianyu_instance = XianyuLive(cookies_str, cookie_id, register_instance=False)
 
         # 调用获取指定页商品信息的方法并同步最新商品详情
         logger.info(f"开始同步账号 {cookie_id} 第{page_number}页商品信息和最新详情（每页{page_size}条）")
@@ -8376,6 +9268,416 @@ def update_item_multi_quantity_delivery(cookie_id: str, item_id: str, delivery_d
 
 # ==================== 订单管理接口 ====================
 
+class OrderHistorySyncRequest(BaseModel):
+    cookie_id: Optional[str] = None
+    start_date: str
+    end_date: str
+    max_orders: int = 120
+    fetch_details: bool = True
+
+
+def _normalize_history_optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _normalize_history_amount_text(value: Any) -> Optional[str]:
+    text = _normalize_history_optional_text(value)
+    if not text:
+        return None
+    return text if parse_order_amount_value(text) is not None else None
+
+
+def _create_order_history_sync_job_snapshot(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        'job_id': job.get('job_id'),
+        'status': job.get('status'),
+        'message': job.get('message'),
+        'error': job.get('error'),
+        'created_at': job.get('created_at'),
+        'started_at': job.get('started_at'),
+        'finished_at': job.get('finished_at'),
+        'request': job.get('request'),
+        'current_account': job.get('current_account'),
+        'current_order_id': job.get('current_order_id'),
+        'accounts_total': job.get('accounts_total', 0),
+        'accounts_completed': job.get('accounts_completed', 0),
+        'orders_discovered': job.get('orders_discovered', 0),
+        'orders_processed': job.get('orders_processed', 0),
+        'orders_saved': job.get('orders_saved', 0),
+        'orders_skipped': job.get('orders_skipped', 0),
+        'orders_failed': job.get('orders_failed', 0),
+        'matched_orders': job.get('matched_orders', 0),
+        'warnings': list(job.get('warnings') or []),
+    }
+
+
+def _append_order_history_sync_warning(job: Dict[str, Any], message: str) -> None:
+    warnings = job.setdefault('warnings', [])
+    if len(warnings) >= 20:
+        return
+    warnings.append(str(message))
+
+
+def _cleanup_order_history_sync_jobs() -> None:
+    now_ts = time.time()
+    expired_job_ids = []
+    for job_id, job in order_history_sync_jobs.items():
+        status_value = str(job.get('status') or '')
+        finished_ts = job.get('finished_ts') or 0
+        if status_value in {'completed', 'failed', 'cancelled'} and finished_ts and (now_ts - finished_ts) > ORDER_HISTORY_SYNC_JOB_RETENTION_SECONDS:
+            expired_job_ids.append(job_id)
+
+    for job_id in expired_job_ids:
+        order_history_sync_jobs.pop(job_id, None)
+        order_history_sync_tasks.pop(job_id, None)
+
+
+def _save_history_order_candidate(cookie_id: str, candidate: Dict[str, Any]) -> bool:
+    order_status = _normalize_history_optional_text(candidate.get('order_status'))
+    normalized_status = normalize_order_status_value(order_status) if order_status else None
+
+    return db_manager.insert_or_update_order(
+        order_id=str(candidate.get('order_id') or '').strip(),
+        item_id=_normalize_history_optional_text(candidate.get('item_id')),
+        buyer_id=_normalize_history_optional_text(candidate.get('buyer_id')),
+        buyer_nick=_normalize_history_optional_text(candidate.get('buyer_nick')),
+        sid=_normalize_history_optional_text(candidate.get('sid')),
+        amount=_normalize_history_amount_text(candidate.get('amount')),
+        order_status=normalized_status,
+        cookie_id=cookie_id,
+        platform_created_at=_normalize_history_optional_text(candidate.get('platform_created_at')),
+        platform_paid_at=_normalize_history_optional_text(candidate.get('platform_paid_at')),
+        platform_completed_at=_normalize_history_optional_text(candidate.get('platform_completed_at')),
+    )
+
+
+def _save_history_order_detail_result(cookie_id: str, candidate: Dict[str, Any], result: Dict[str, Any]) -> bool:
+    order_id = _normalize_history_optional_text(result.get('order_id')) or _normalize_history_optional_text(candidate.get('order_id'))
+    if not order_id:
+        return False
+
+    raw_status = _normalize_history_optional_text(result.get('order_status'))
+    normalized_status = normalize_order_status_value(raw_status) if raw_status and raw_status.lower() != 'unknown' else None
+
+    return db_manager.insert_or_update_order(
+        order_id=order_id,
+        item_id=_normalize_history_optional_text(result.get('item_id')) or _normalize_history_optional_text(candidate.get('item_id')),
+        buyer_id=_normalize_history_optional_text(candidate.get('buyer_id')),
+        buyer_nick=_normalize_history_optional_text(candidate.get('buyer_nick')),
+        sid=_normalize_history_optional_text(candidate.get('sid')),
+        spec_name=_normalize_history_optional_text(result.get('spec_name')),
+        spec_value=_normalize_history_optional_text(result.get('spec_value')),
+        spec_name_2=_normalize_history_optional_text(result.get('spec_name_2')),
+        spec_value_2=_normalize_history_optional_text(result.get('spec_value_2')),
+        quantity=_normalize_history_optional_text(result.get('quantity')),
+        amount=_normalize_history_amount_text(result.get('amount')) or _normalize_history_amount_text(candidate.get('amount')),
+        order_status=normalized_status,
+        cookie_id=cookie_id,
+        platform_created_at=_normalize_history_optional_text(result.get('platform_created_at')) or _normalize_history_optional_text(candidate.get('platform_created_at')),
+        platform_paid_at=_normalize_history_optional_text(result.get('platform_paid_at')) or _normalize_history_optional_text(candidate.get('platform_paid_at')),
+        platform_completed_at=_normalize_history_optional_text(result.get('platform_completed_at')) or _normalize_history_optional_text(candidate.get('platform_completed_at')),
+    )
+
+
+async def _run_order_history_sync_job(job_id: str) -> None:
+    job = order_history_sync_jobs.get(job_id)
+    if not job:
+        return
+
+    request_data = dict(job.get('request') or {})
+    user_info = dict(job.get('user_info') or {})
+    current_user_id = user_info.get('user_id')
+
+    from utils.order_history_sync import OrderHistoryPageFetcher
+
+    try:
+        utc_start = local_date_to_utc_start(request_data.get('start_date'))
+        utc_end_exclusive = local_date_to_utc_end_exclusive(request_data.get('end_date'))
+        if not utc_start or not utc_end_exclusive:
+            raise ValueError('日期格式错误，应为 YYYY-MM-DD')
+        if utc_start >= utc_end_exclusive:
+            raise ValueError('开始日期必须早于结束日期')
+
+        max_orders = int(request_data.get('max_orders') or 120)
+        max_orders = min(max(max_orders, 1), 500)
+        fetch_details = bool(request_data.get('fetch_details', True))
+
+        user_cookies = db_manager.get_all_cookies(current_user_id)
+        selected_cookie_id = _normalize_history_optional_text(request_data.get('cookie_id'))
+        if selected_cookie_id:
+            if selected_cookie_id not in user_cookies:
+                raise ValueError('指定账号不存在或无权限访问')
+            target_cookie_ids = [selected_cookie_id]
+        else:
+            target_cookie_ids = list(user_cookies.keys())
+
+        if not target_cookie_ids:
+            raise ValueError('当前没有可同步的账号')
+
+        _cleanup_order_history_sync_jobs()
+
+        job.update({
+            'status': 'running',
+            'message': '开始同步历史订单',
+            'error': None,
+            'started_at': get_local_now().strftime('%Y-%m-%d %H:%M:%S'),
+            'accounts_total': len(target_cookie_ids),
+            'accounts_completed': 0,
+            'orders_discovered': 0,
+            'orders_processed': 0,
+            'orders_saved': 0,
+            'orders_skipped': 0,
+            'orders_failed': 0,
+            'matched_orders': 0,
+            'warnings': [],
+        })
+
+        for account_index, cookie_id in enumerate(target_cookie_ids, start=1):
+            if job.get('status') == 'cancelled':
+                return
+
+            remaining_limit = max_orders - int(job.get('matched_orders') or 0)
+            if remaining_limit <= 0:
+                break
+
+            cookie_string = user_cookies.get(cookie_id)
+            if not cookie_string:
+                _append_order_history_sync_warning(job, f'账号 {cookie_id} 缺少 Cookie，已跳过')
+                job['accounts_completed'] = account_index
+                continue
+
+            job['current_account'] = cookie_id
+            job['current_order_id'] = None
+            job['message'] = f'正在抓取账号 {cookie_id} 的历史订单列表'
+
+            history_fetcher = OrderHistoryPageFetcher(cookie_string, cookie_id_for_log=cookie_id, headless=True)
+            live_instance = cookie_manager.manager.get_xianyu_instance(cookie_id) if cookie_manager.manager else None
+
+            try:
+                fetch_result = await history_fetcher.fetch_recent_orders(
+                    max_orders=remaining_limit,
+                    utc_start=utc_start,
+                    utc_end_exclusive=utc_end_exclusive,
+                )
+                candidates = list(fetch_result.get('orders') or [])
+                scanned_count = int(fetch_result.get('scanned_count') or 0)
+                matched_count = int(fetch_result.get('matched_count') or 0)
+                out_of_range_count = int(fetch_result.get('out_of_range_count') or 0)
+
+                job['orders_discovered'] += scanned_count
+                job['matched_orders'] += matched_count
+                job['orders_skipped'] += out_of_range_count
+
+                if live_instance is not None:
+                    await history_fetcher.close()
+
+                if job.get('status') == 'cancelled':
+                    return
+
+                if not candidates:
+                    if scanned_count > 0 and out_of_range_count > 0:
+                        _append_order_history_sync_warning(job, f'账号 {cookie_id} 未命中时间范围内的历史订单')
+                    else:
+                        _append_order_history_sync_warning(job, f'账号 {cookie_id} 未抓到历史订单候选')
+                    job['accounts_completed'] = account_index
+                    continue
+
+                for candidate in candidates:
+                    if job.get('status') == 'cancelled':
+                        return
+
+                    order_id = _normalize_history_optional_text(candidate.get('order_id'))
+                    if not order_id:
+                        continue
+
+                    job['current_order_id'] = order_id
+                    job['orders_processed'] += 1
+                    job['message'] = f'正在同步账号 {cookie_id} 的订单 {order_id}'
+
+                    detail_saved = False
+                    detail_result = None
+
+                    if fetch_details:
+                        try:
+                            if live_instance is not None:
+                                detail_result = await live_instance.fetch_order_detail_info(
+                                    order_id=order_id,
+                                    item_id=_normalize_history_optional_text(candidate.get('item_id')),
+                                    buyer_id=_normalize_history_optional_text(candidate.get('buyer_id')),
+                                    sid=_normalize_history_optional_text(candidate.get('sid')),
+                                    force_refresh=True,
+                                    buyer_nick=_normalize_history_optional_text(candidate.get('buyer_nick')),
+                                    buyer_id_source='history_sync',
+                                )
+                                detail_saved = bool(detail_result)
+                            else:
+                                detail_result = await history_fetcher.fetch_order_detail(order_id, force_refresh=True)
+                                if detail_result:
+                                    detail_saved = _save_history_order_detail_result(cookie_id, candidate, detail_result)
+                        except Exception as sync_exc:
+                            logger.warning(f"历史订单详情同步失败: cookie_id={cookie_id}, order_id={order_id}, error={sync_exc}")
+                            _append_order_history_sync_warning(job, f'订单 {order_id} 详情刷新失败: {sync_exc}')
+
+                    if not fetch_details or not detail_saved:
+                        if _save_history_order_candidate(cookie_id, candidate):
+                            detail_saved = True
+                        else:
+                            _append_order_history_sync_warning(job, f'订单 {order_id} 基础信息写库失败')
+
+                    if detail_saved:
+                        job['orders_saved'] += 1
+                    else:
+                        job['orders_skipped'] += 1
+                        job['orders_failed'] += 1
+
+                job['accounts_completed'] = account_index
+            finally:
+                await history_fetcher.close()
+
+        job['status'] = 'completed'
+        job['message'] = (
+            f"历史订单同步完成，共扫描 {job.get('orders_discovered', 0)} 单，"
+            f"命中时间范围 {job.get('matched_orders', 0)} 单，入库/更新 {job.get('orders_saved', 0)} 单"
+        )
+    except asyncio.CancelledError:
+        logger.info(f"历史订单同步任务已取消: {job_id}")
+        job['status'] = 'cancelled'
+        job['error'] = None
+        job['message'] = job.get('message') or '历史订单同步已取消'
+    except Exception as exc:
+        logger.error(f"历史订单同步任务失败: {exc}")
+        job['status'] = 'failed'
+        job['error'] = str(exc)
+        job['message'] = f'历史订单同步失败: {exc}'
+    finally:
+        job['current_order_id'] = None
+        job['current_account'] = None
+        job['finished_at'] = get_local_now().strftime('%Y-%m-%d %H:%M:%S')
+        job['finished_ts'] = time.time()
+
+
+@app.post('/api/orders/history-sync')
+async def start_order_history_sync(request: OrderHistorySyncRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """按时间范围同步历史订单。"""
+    try:
+        request_data = request.dict()
+        start_date = str(request_data.get('start_date') or '').strip()
+        end_date = str(request_data.get('end_date') or '').strip()
+        if not start_date or not end_date:
+            raise HTTPException(status_code=400, detail='开始日期和结束日期不能为空')
+
+        cookie_id = _normalize_history_optional_text(request_data.get('cookie_id'))
+        max_orders = min(max(int(request_data.get('max_orders') or 120), 1), 500)
+        fetch_details = bool(request_data.get('fetch_details', True))
+
+        _cleanup_order_history_sync_jobs()
+
+        job_id = f"history_sync_{secrets.token_hex(8)}"
+        created_at = get_local_now().strftime('%Y-%m-%d %H:%M:%S')
+        job = {
+            'job_id': job_id,
+            'status': 'pending',
+            'message': '历史订单同步任务已创建，等待执行',
+            'error': None,
+            'created_at': created_at,
+            'started_at': None,
+            'finished_at': None,
+            'finished_ts': None,
+            'request': {
+                'cookie_id': cookie_id,
+                'start_date': start_date,
+                'end_date': end_date,
+                'max_orders': max_orders,
+                'fetch_details': fetch_details,
+            },
+            'user_id': current_user['user_id'],
+            'user_info': {
+                'user_id': current_user['user_id'],
+                'username': current_user.get('username'),
+            },
+            'current_account': None,
+            'current_order_id': None,
+            'accounts_total': 0,
+            'accounts_completed': 0,
+            'orders_discovered': 0,
+            'orders_processed': 0,
+            'orders_saved': 0,
+            'orders_skipped': 0,
+            'orders_failed': 0,
+            'matched_orders': 0,
+            'warnings': [],
+        }
+        order_history_sync_jobs[job_id] = job
+
+        task = asyncio.create_task(_run_order_history_sync_job(job_id))
+        order_history_sync_tasks[job_id] = task
+
+        def _on_task_done(done_task: asyncio.Task) -> None:
+            order_history_sync_tasks.pop(job_id, None)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as task_exc:
+                logger.error(f"历史订单同步后台任务异常: job_id={job_id}, error={task_exc}")
+
+        task.add_done_callback(_on_task_done)
+
+        log_with_user(
+            'info',
+            f"创建历史订单同步任务: job_id={job_id}, cookie_id={cookie_id or 'ALL'}, range={start_date}~{end_date}, max_orders={max_orders}, fetch_details={fetch_details}",
+            current_user
+        )
+        return {"success": True, "data": _create_order_history_sync_job_snapshot(job)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log_with_user('error', f"创建历史订单同步任务失败: {exc}", current_user)
+        raise HTTPException(status_code=500, detail=f"创建历史订单同步任务失败: {exc}")
+
+
+@app.get('/api/orders/history-sync/{job_id}')
+def get_order_history_sync_status(job_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """查询历史订单同步任务状态。"""
+    _cleanup_order_history_sync_jobs()
+
+    job = order_history_sync_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail='历史订单同步任务不存在或已过期')
+    if job.get('user_id') != current_user['user_id']:
+        raise HTTPException(status_code=403, detail='无权访问该历史订单同步任务')
+
+    return {"success": True, "data": _create_order_history_sync_job_snapshot(job)}
+
+
+@app.post('/api/orders/history-sync/{job_id}/cancel')
+def cancel_order_history_sync(job_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """取消历史订单同步任务。"""
+    job = order_history_sync_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail='历史订单同步任务不存在或已过期')
+    if job.get('user_id') != current_user['user_id']:
+        raise HTTPException(status_code=403, detail='无权取消该历史订单同步任务')
+
+    if str(job.get('status') or '') in {'completed', 'failed', 'cancelled'}:
+        return {"success": True, "data": _create_order_history_sync_job_snapshot(job)}
+
+    job['status'] = 'cancelled'
+    job['error'] = None
+    job['message'] = '历史订单同步已取消'
+    job['finished_at'] = get_local_now().strftime('%Y-%m-%d %H:%M:%S')
+    job['finished_ts'] = time.time()
+
+    task = order_history_sync_tasks.get(job_id)
+    if task and not task.done():
+        task.cancel()
+
+    return {"success": True, "data": _create_order_history_sync_job_snapshot(job)}
+
+
 @app.get('/api/orders')
 def get_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户的订单信息"""
@@ -8397,8 +9699,11 @@ def get_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
                 order['cookie_id'] = cookie_id
                 all_orders.append(order)
 
-        # 按创建时间倒序排列
-        all_orders.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        # 历史订单补录后优先按平台下单时间展示，回退到本地入库时间
+        all_orders.sort(
+            key=lambda x: x.get('platform_created_at') or x.get('created_at') or '',
+            reverse=True
+        )
 
         log_with_user('info', f"用户订单查询成功，共 {len(all_orders)} 条记录", current_user)
         return {"success": True, "data": all_orders}
@@ -8569,6 +9874,7 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
             return {"success": True, "delivered": True, "message": "订单当前没有可补发的未完成单元"}
 
         unit_results = []
+        prepared_units = []
 
         def format_delivery_reason(reason: str, order_spec_mode: str = None, rule_spec_mode: str = None, item_config_mode: str = None) -> str:
             context_parts = []
@@ -8635,126 +9941,11 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
             if delivery_success:
                 if not delivery_steps:
                     delivery_steps = xianyu_instance._build_delivery_steps(delivery_content, '')
-
-                try:
-                    ws = getattr(xianyu_instance, 'ws', None)
-                    if ws:
-                        sid = order.get('sid', '')
-                        if sid:
-                            cid = sid.replace('@goofish', '')
-                            log_with_user('info', f"手动发货: 使用现有WebSocket连接发送, cid={cid}, buyer_id={buyer_id}, unit={unit_index}", current_user)
-                            await xianyu_instance._send_delivery_steps(
-                                ws,
-                                cid,
-                                buyer_id,
-                                delivery_steps,
-                                log_prefix=f"手动发货 order_id={order_id} unit={unit_index}"
-                            )
-                        else:
-                            log_with_user('warning', f"手动发货: 订单无sid，尝试使用buyer_id作为cid, unit={unit_index}", current_user)
-                            await xianyu_instance._send_delivery_steps(
-                                ws,
-                                buyer_id,
-                                buyer_id,
-                                delivery_steps,
-                                log_prefix=f"手动发货 order_id={order_id} unit={unit_index}"
-                            )
-                    else:
-                        log_with_user('warning', f"手动发货: 无现有WebSocket连接，使用send_delivery_steps_once, unit={unit_index}", current_user)
-                        await xianyu_instance.send_delivery_steps_once(buyer_id, item_id, delivery_steps)
-
-                    if not xianyu_instance._mark_data_reservation_sent_if_needed({
-                        'data_reservation_id': data_reservation_id,
-                        'data_reservation_status': data_reservation_status
-                    }):
-                        xianyu_instance._release_data_reservation_if_needed(
-                            {'data_reservation_id': data_reservation_id},
-                            error=f'手动发货发送成功后标记预占已发送失败(unit={unit_index})'
-                        )
-                        unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': '批量数据预占标记已发送失败'})
-                        continue
-
-                    delivery_meta = {
-                        'success': True,
-                        'rule_id': rule_id,
-                        'card_id': card_id,
-                        'card_type': card_type,
-                        'data_card_pending_consume': data_card_pending_consume,
-                        'data_line': data_line,
-                        'data_reservation_id': data_reservation_id,
-                        'data_reservation_status': data_reservation_status,
-                        'delivery_unit_index': unit_index,
-                    }
-                    xianyu_instance._persist_delivery_finalization_state(
-                        order_id=order_id,
-                        item_id=item_id,
-                        buyer_id=buyer_id,
-                        delivery_meta=delivery_meta,
-                        channel='manual',
-                        status='sent'
-                    )
-
-                    finalize_result = await xianyu_instance._finalize_delivery_after_send(
-                        delivery_meta=delivery_meta,
-                        order_id=order_id,
-                        item_id=item_id
-                    )
-                    if not finalize_result.get('success'):
-                        xianyu_instance._persist_delivery_finalization_state(
-                            order_id=order_id,
-                            item_id=item_id,
-                            buyer_id=buyer_id,
-                            delivery_meta=delivery_meta,
-                            channel='manual',
-                            status='sent',
-                            last_error=finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败'
-                        )
-                        db_manager.create_delivery_log(
-                            user_id=user_id,
-                            cookie_id=cookie_id,
-                            order_id=order_id,
-                            item_id=item_id,
-                            buyer_id=buyer_id,
-                            buyer_nick=order.get('buyer_nick'),
-                            rule_id=rule_id,
-                            rule_keyword=rule_keyword,
-                            card_type=card_type,
-                            match_mode=match_mode,
-                            channel='manual',
-                            status='failed',
-                            reason=format_delivery_reason(finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败', order_spec_mode, rule_spec_mode, item_config_mode)
-                        )
-                        unit_results.append({'unit_index': unit_index, 'status': 'pending_finalize', 'error': finalize_result.get('error') or '发送成功但提交发货副作用失败'})
-                        continue
-
-                    xianyu_instance._persist_delivery_finalization_state(
-                        order_id=order_id,
-                        item_id=item_id,
-                        buyer_id=buyer_id,
-                        delivery_meta=delivery_meta,
-                        channel='manual',
-                        status='finalized'
-                    )
-                    db_manager.create_delivery_log(
-                        user_id=user_id,
-                        cookie_id=cookie_id,
-                        order_id=order_id,
-                        item_id=item_id,
-                        buyer_id=buyer_id,
-                        buyer_nick=order.get('buyer_nick'),
-                        rule_id=rule_id,
-                        rule_keyword=rule_keyword,
-                        card_type=card_type,
-                        match_mode=match_mode,
-                        channel='manual',
-                        status='success',
-                        reason=format_delivery_reason(f'手动发货第 {unit_index} 个单元发送成功', order_spec_mode, rule_spec_mode, item_config_mode)
-                    )
-                    unit_results.append({'unit_index': unit_index, 'status': 'finalized'})
-                except Exception as send_error:
+                if not delivery_steps:
+                    fail_reason = f"第 {unit_index} 个发货单元发货步骤构建失败"
                     xianyu_instance._release_data_reservation_if_needed(
                         {'data_reservation_id': data_reservation_id},
-                        error=f"手动发货发送失败(unit={unit_index}): {str(send_error)}"
+                        error=fail_reason
                     )
                     db_manager.create_delivery_log(
                         user_id=user_id,
@@ -8769,9 +9960,32 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                         match_mode=match_mode,
                         channel='manual',
                         status='failed',
-                        reason=format_delivery_reason(f"第 {unit_index} 个发货单元消息发送失败: {str(send_error)}", order_spec_mode, rule_spec_mode, item_config_mode)
+                        reason=format_delivery_reason(fail_reason, order_spec_mode, rule_spec_mode, item_config_mode)
                     )
-                    unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': str(send_error)})
+                    unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': fail_reason})
+                    continue
+
+                prepared_units.append({
+                    'unit_index': unit_index,
+                    'delivery_steps': delivery_steps,
+                    'card_type': card_type,
+                    'rule_meta': {
+                        'success': True,
+                        'rule_id': rule_id,
+                        'rule_keyword': rule_keyword,
+                        'card_id': card_id,
+                        'card_type': card_type,
+                        'match_mode': match_mode,
+                        'order_spec_mode': order_spec_mode,
+                        'rule_spec_mode': rule_spec_mode,
+                        'item_config_mode': item_config_mode,
+                        'data_card_pending_consume': data_card_pending_consume,
+                        'data_line': data_line,
+                        'data_reservation_id': data_reservation_id,
+                        'data_reservation_status': data_reservation_status,
+                        'delivery_unit_index': unit_index,
+                    }
+                })
             else:
                 fail_reason = failure_reason or f"第 {unit_index} 个发货单元未匹配到发货规则，请检查卡券和发货规则配置"
                 db_manager.create_delivery_log(
@@ -8790,6 +10004,198 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                     reason=format_delivery_reason(fail_reason, order_spec_mode, rule_spec_mode, item_config_mode)
                 )
                 unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': fail_reason})
+
+        ws = getattr(xianyu_instance, 'ws', None)
+        manual_chat_id = buyer_id
+        if ws:
+            sid = order.get('sid', '')
+            if sid:
+                manual_chat_id = sid.replace('@goofish', '')
+                log_with_user('info', f"手动发货: 使用现有WebSocket连接发送, cid={manual_chat_id}, buyer_id={buyer_id}", current_user)
+            else:
+                log_with_user('warning', f"手动发货: 订单无sid，尝试使用buyer_id作为cid, buyer_id={buyer_id}", current_user)
+        else:
+            log_with_user('warning', f"手动发货: 无现有WebSocket连接，使用send_delivery_steps_once, buyer_id={buyer_id}", current_user)
+
+        send_groups = xianyu_instance._build_delivery_send_groups(prepared_units, expected_quantity)
+        total_send_groups = len(send_groups)
+
+        for group_index, send_group in enumerate(send_groups, start=1):
+            group_units = send_group.get('units') or []
+            if not group_units:
+                continue
+
+            first_unit = group_units[0]
+            first_unit_index = first_unit.get('unit_index') or 1
+            is_batched_text_group = send_group.get('mode') == 'batched_text'
+
+            try:
+                if ws:
+                    await xianyu_instance._send_delivery_steps(
+                        ws,
+                        manual_chat_id,
+                        buyer_id,
+                        send_group.get('delivery_steps') or [],
+                        log_prefix=(
+                            f"手动发货 order_id={order_id} batch={group_index}/{total_send_groups}"
+                            if is_batched_text_group else
+                            f"手动发货 order_id={order_id} unit={first_unit_index}"
+                        )
+                    )
+                else:
+                    await xianyu_instance.send_delivery_steps_once(buyer_id, item_id, send_group.get('delivery_steps') or [])
+            except Exception as send_error:
+                send_error_text = str(send_error)
+                for prepared_unit in group_units:
+                    unit_index = prepared_unit.get('unit_index') or 1
+                    rule_meta = prepared_unit.get('rule_meta') or {}
+                    xianyu_instance._release_data_reservation_if_needed(
+                        rule_meta,
+                        error=f"手动发货发送失败(unit={unit_index}): {send_error_text}"
+                    )
+                    db_manager.create_delivery_log(
+                        user_id=user_id,
+                        cookie_id=cookie_id,
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        buyer_nick=order.get('buyer_nick'),
+                        rule_id=rule_meta.get('rule_id'),
+                        rule_keyword=rule_meta.get('rule_keyword'),
+                        card_type=rule_meta.get('card_type'),
+                        match_mode=rule_meta.get('match_mode'),
+                        channel='manual',
+                        status='failed',
+                        reason=format_delivery_reason(f"第 {unit_index} 个发货单元消息发送失败: {send_error_text}", rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
+                    )
+                    unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': send_error_text})
+                continue
+
+            for prepared_unit in group_units:
+                unit_index = prepared_unit.get('unit_index') or 1
+                rule_meta = prepared_unit.get('rule_meta') or {}
+
+                try:
+                    if not xianyu_instance._mark_data_reservation_sent_if_needed(rule_meta):
+                        xianyu_instance._release_data_reservation_if_needed(
+                            rule_meta,
+                            error=f'手动发货发送成功后标记预占已发送失败(unit={unit_index})'
+                        )
+                        db_manager.create_delivery_log(
+                            user_id=user_id,
+                            cookie_id=cookie_id,
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            buyer_nick=order.get('buyer_nick'),
+                            rule_id=rule_meta.get('rule_id'),
+                            rule_keyword=rule_meta.get('rule_keyword'),
+                            card_type=rule_meta.get('card_type'),
+                            match_mode=rule_meta.get('match_mode'),
+                            channel='manual',
+                            status='failed',
+                            reason=format_delivery_reason('批量数据预占标记已发送失败', rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
+                        )
+                        unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': '批量数据预占标记已发送失败'})
+                        continue
+
+                    xianyu_instance._persist_delivery_finalization_state(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=rule_meta,
+                        channel='manual',
+                        status='sent'
+                    )
+
+                    finalize_result = await xianyu_instance._finalize_delivery_after_send(
+                        delivery_meta=rule_meta,
+                        order_id=order_id,
+                        item_id=item_id
+                    )
+                    if not finalize_result.get('success'):
+                        xianyu_instance._persist_delivery_finalization_state(
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            delivery_meta=rule_meta,
+                            channel='manual',
+                            status='sent',
+                            last_error=finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败'
+                        )
+                        db_manager.create_delivery_log(
+                            user_id=user_id,
+                            cookie_id=cookie_id,
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            buyer_nick=order.get('buyer_nick'),
+                            rule_id=rule_meta.get('rule_id'),
+                            rule_keyword=rule_meta.get('rule_keyword'),
+                            card_type=rule_meta.get('card_type'),
+                            match_mode=rule_meta.get('match_mode'),
+                            channel='manual',
+                            status='failed',
+                            reason=format_delivery_reason(finalize_result.get('error') or f'第 {unit_index} 个发货单元发送成功但提交发货副作用失败', rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
+                        )
+                        unit_results.append({'unit_index': unit_index, 'status': 'pending_finalize', 'error': finalize_result.get('error') or '发送成功但提交发货副作用失败'})
+                        continue
+
+                    xianyu_instance._persist_delivery_finalization_state(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=rule_meta,
+                        channel='manual',
+                        status='finalized'
+                    )
+                    success_reason = f'手动发货第 {unit_index} 个单元发送成功'
+                    if is_batched_text_group and len(group_units) > 1:
+                        success_reason += '（批量合并发送）'
+                    db_manager.create_delivery_log(
+                        user_id=user_id,
+                        cookie_id=cookie_id,
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        buyer_nick=order.get('buyer_nick'),
+                        rule_id=rule_meta.get('rule_id'),
+                        rule_keyword=rule_meta.get('rule_keyword'),
+                        card_type=rule_meta.get('card_type'),
+                        match_mode=rule_meta.get('match_mode'),
+                        channel='manual',
+                        status='success',
+                        reason=format_delivery_reason(success_reason, rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
+                    )
+                    unit_results.append({'unit_index': unit_index, 'status': 'finalized'})
+
+                except Exception as unit_post_error:
+                    unit_error_text = str(unit_post_error)
+                    xianyu_instance._persist_delivery_finalization_state(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=rule_meta,
+                        channel='manual',
+                        status='sent',
+                        last_error=f'第 {unit_index} 个发货单元消息已发送，但发送后处理异常: {unit_error_text}'
+                    )
+                    db_manager.create_delivery_log(
+                        user_id=user_id,
+                        cookie_id=cookie_id,
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        buyer_nick=order.get('buyer_nick'),
+                        rule_id=rule_meta.get('rule_id'),
+                        rule_keyword=rule_meta.get('rule_keyword'),
+                        card_type=rule_meta.get('card_type'),
+                        match_mode=rule_meta.get('match_mode'),
+                        channel='manual',
+                        status='failed',
+                        reason=format_delivery_reason(f"第 {unit_index} 个发货单元消息已发送，但发送后处理异常: {unit_error_text}", rule_meta.get('order_spec_mode'), rule_meta.get('rule_spec_mode'), rule_meta.get('item_config_mode'))
+                    )
+                    unit_results.append({'unit_index': unit_index, 'status': 'pending_finalize', 'error': unit_error_text})
 
         progress_summary_after = xianyu_instance._sync_order_delivery_progress(
             order_id=order_id,
@@ -9333,7 +10739,7 @@ async def polish_account_items(cid: str, current_user: Dict[str, Any] = Depends(
             return {"success": False, "message": "账号cookie信息为空"}
 
         from XianyuAutoAsync import XianyuLive
-        xianyu_instance = XianyuLive(cookies_str, cid)
+        xianyu_instance = XianyuLive(cookies_str, cid, register_instance=False)
 
         logger.info(f"开始擦亮账号 {cid} 的所有商品")
         result = await xianyu_instance.polish_all_items()
@@ -9586,7 +10992,7 @@ async def scheduled_task_checker():
                                 result = {"success": False, "message": "账号cookie为空"}
                             else:
                                 from XianyuAutoAsync import XianyuLive
-                                xianyu_instance = XianyuLive(cookies_str, account_id)
+                                xianyu_instance = XianyuLive(cookies_str, account_id, register_instance=False)
                                 result = await xianyu_instance.polish_all_items()
                                 await xianyu_instance.close_session()
                     else:

@@ -14,6 +14,7 @@ import re
 import json
 from threading import Lock
 from collections import defaultdict
+from utils.time_utils import parse_local_datetime_text_to_db_utc
 
 # 修复Docker环境中的asyncio事件循环策略问题
 if sys.platform.startswith('linux') or os.getenv('DOCKER_ENV'):
@@ -299,6 +300,9 @@ class OrderDetailFetcher:
                                 'quantity': existing_order.get('quantity', ''),
                                 'amount': existing_order.get('amount', ''),
                                 'amount_source': 'cache',
+                                'platform_created_at': existing_order.get('platform_created_at'),
+                                'platform_paid_at': existing_order.get('platform_paid_at'),
+                                'platform_completed_at': existing_order.get('platform_completed_at'),
                                 'timestamp': time.time(),
                                 'from_cache': True  # 标记数据来源
                             }
@@ -449,6 +453,8 @@ class OrderDetailFetcher:
                         logger.warning(f"获取页面标题失败: {e}")
                         title = f"订单详情 - {order_id}"
 
+                    order_time_fields = await self._get_order_time_fields()
+
                     result = {
                         'order_id': order_id,
                         'url': url,
@@ -464,6 +470,9 @@ class OrderDetailFetcher:
                         'spec_parse_mode': self._classify_spec_parse_mode(sku_info),
                         'order_status': order_status,  # 订单状态
                         'order_status_source': self._last_order_status_source,
+                        'platform_created_at': order_time_fields.get('platform_created_at'),
+                        'platform_paid_at': order_time_fields.get('platform_paid_at'),
+                        'platform_completed_at': order_time_fields.get('platform_completed_at'),
                         'timestamp': time.time(),
                         'from_cache': False  # 标记数据来源
                     }
@@ -738,6 +747,107 @@ class OrderDetailFetcher:
             return None
         return normalized
 
+    def _normalize_sku_candidate_text(self, sku_text: Any) -> str:
+        if sku_text is None:
+            return ''
+        return re.sub(r'\s+', ' ', str(sku_text).replace('：', ':')).strip()
+
+    def _is_numeric_index_spec_name_like(self, spec_name: str, spec_value: str) -> bool:
+        normalized_name = re.sub(r'\s+', '', (spec_name or '').strip())
+        normalized_value = re.sub(r'\s+', ' ', (spec_value or '').strip())
+        if not normalized_name or not normalized_value:
+            return False
+
+        if not re.fullmatch(r'(?:第)?\d{1,2}(?:项|号|档)?', normalized_name):
+            return False
+
+        if len(normalized_value) < 2 or len(normalized_value) > 40:
+            return False
+
+        if self._is_datetime_like(normalized_value):
+            return False
+
+        if re.fullmatch(r'[¥￥]?\d+(?:\.\d{1,2})?', normalized_value):
+            return False
+
+        if normalized_value.lower().startswith(('http://', 'https://', 'fleamarket://')):
+            return False
+
+        if not re.search(r'[\u4e00-\u9fffA-Za-z]', normalized_value):
+            return False
+
+        return True
+
+    def _score_sku_text_candidate(
+        self,
+        normalized_key: str,
+        *,
+        path: str = '',
+        context: str = '',
+        sku_text: str = '',
+        from_pair: bool = False
+    ) -> int:
+        key = str(normalized_key or '').lower()
+        path_lower = str(path or '').lower()
+        normalized_context = re.sub(r'\s+', ' ', str(context or '')).strip()
+        normalized_sku_text = self._normalize_sku_candidate_text(sku_text)
+
+        if not normalized_sku_text or len(normalized_sku_text) > 120 or ':' not in normalized_sku_text:
+            return 0
+
+        score = 0
+        strong_keys = {
+            'skuinfo', 'sku_info', 'skutext', 'sku_text', 'skudesc', 'sku_desc',
+            'skucontent', 'sku_content', 'specinfo', 'spec_info', 'spectext',
+            'spec_text', 'specdesc', 'spec_desc', 'itemsku', 'item_sku',
+            'itemspec', 'item_spec'
+        }
+        medium_key_tokens = ('sku', 'spec', 'attr', 'property', 'option', 'variant', 'model')
+
+        if key in strong_keys:
+            score = 220
+        elif any(token in key for token in medium_key_tokens):
+            score = 170
+        elif from_pair:
+            score = 135
+        elif any(token in path_lower for token in ('.sku', '.spec', '.attr', '.property', '.option', '.variant', '.model')):
+            score = 120
+        else:
+            return 0
+
+        if '.iteminfo.' in path_lower:
+            score += 70
+        elif '.components[' in path_lower:
+            score += 20
+
+        if any(token in normalized_context for token in ('规格', '型号', '版本', '选项', '属性', '套餐')):
+            score += 35
+
+        if ';' in normalized_sku_text:
+            score += 10
+
+        return score
+
+    def _append_sku_candidate(
+        self,
+        candidates: List[Dict[str, Any]],
+        sku_text: Any,
+        *,
+        quantity: Optional[str] = None,
+        path: str = '',
+        score: int = 0
+    ) -> None:
+        normalized_sku_text = self._normalize_sku_candidate_text(sku_text)
+        if score <= 0 or not normalized_sku_text or len(normalized_sku_text) > 120 or ':' not in normalized_sku_text:
+            return
+
+        candidates.append({
+            'sku_text': normalized_sku_text,
+            'quantity': quantity,
+            'path': path,
+            'score': score,
+        })
+
     def _extract_sku_candidates_from_payload(self, payload: Any, path: str = 'root', depth: int = 0) -> List[Dict[str, Any]]:
         if payload is None or depth > 8:
             return []
@@ -752,28 +862,94 @@ class OrderDetailFetcher:
                     if quantity_context:
                         break
 
+            context_fields = []
+            for context_key in ('title', 'label', 'name', 'preText', 'subTitle', 'displayText', 'content', 'desc', 'text'):
+                context_value = payload.get(context_key)
+                if isinstance(context_value, (str, int, float)):
+                    normalized_context_value = self._normalize_sku_candidate_text(context_value)
+                    if normalized_context_value:
+                        context_fields.append(normalized_context_value)
+            dict_context = ' | '.join(context_fields)[:240]
+
+            title_text = ''
+            title_key = ''
+            for candidate_key in ('title', 'label', 'name', 'preText', 'subTitle', 'displayText', 'key', 'attrName', 'specName', 'skuName'):
+                candidate_value = payload.get(candidate_key)
+                if isinstance(candidate_value, (str, int, float)):
+                    normalized_title = self._normalize_sku_candidate_text(candidate_value)
+                    if normalized_title:
+                        title_text = normalized_title
+                        title_key = candidate_key
+                        break
+
+            value_text = ''
+            value_key = ''
+            for candidate_key in ('value', 'text', 'content', 'displayText', 'attrValue', 'specValue', 'skuValue'):
+                candidate_value = payload.get(candidate_key)
+                if isinstance(candidate_value, (str, int, float)):
+                    normalized_value = self._normalize_sku_candidate_text(candidate_value)
+                    if normalized_value:
+                        value_text = normalized_value
+                        value_key = candidate_key
+                        break
+
+            if not quantity_context and title_text and value_text and any(token in title_text for token in ('数量', '购买数量', '件数')):
+                quantity_context = self._normalize_quantity_text(value_text)
+
+            if (
+                title_text and value_text and
+                ':' not in title_text and ':' not in value_text and
+                (
+                    self._is_text_fallback_spec_name_like(title_text) or
+                    self._is_numeric_index_spec_name_like(title_text, value_text)
+                )
+            ):
+                pair_path = f"{path}.{title_key}+{value_key}" if title_key and value_key else path
+                pair_sku_text = f"{title_text}:{value_text}"
+                pair_score = self._score_sku_text_candidate(
+                    f"{title_key}_{value_key}",
+                    path=pair_path,
+                    context=dict_context,
+                    sku_text=pair_sku_text,
+                    from_pair=True
+                )
+                self._append_sku_candidate(
+                    candidates,
+                    pair_sku_text,
+                    quantity=quantity_context,
+                    path=pair_path,
+                    score=pair_score
+                )
+
             for key, value in payload.items():
                 key_text = str(key)
-                normalized_key = key_text.lower()
+                normalized_key = re.sub(r'[^0-9A-Za-z\u4e00-\u9fff]', '', key_text).lower()
                 key_path = f"{path}.{key_text}"
 
-                if normalized_key in {'skuinfo', 'sku_info', 'skutext', 'sku_text', 'skudesc', 'sku_desc'} and isinstance(value, str):
-                    sku_text = re.sub(r'\s+', ' ', value).strip()
-                    if sku_text and len(sku_text) <= 120 and (':' in sku_text or '：' in sku_text):
-                        score = 180
-                        if '.itemInfo.' in key_path:
-                            score += 80
-                        if quantity_context:
-                            score += 10
-                        if ';' in sku_text:
-                            score += 10
+                if isinstance(value, str):
+                    nested_payload = self._try_parse_json_text(value)
+                    if nested_payload is not None:
+                        candidates.extend(
+                            self._extract_sku_candidates_from_payload(
+                                nested_payload,
+                                path=f"{key_path}.json",
+                                depth=depth + 1
+                            )
+                        )
 
-                        candidates.append({
-                            'sku_text': sku_text,
-                            'quantity': quantity_context,
-                            'path': key_path,
-                            'score': score,
-                        })
+                    score = self._score_sku_text_candidate(
+                        normalized_key,
+                        path=key_path,
+                        context=dict_context,
+                        sku_text=value
+                    )
+                    self._append_sku_candidate(
+                        candidates,
+                        value,
+                        quantity=quantity_context,
+                        path=key_path,
+                        score=score
+                    )
 
                 candidates.extend(self._extract_sku_candidates_from_payload(value, path=key_path, depth=depth + 1))
 
@@ -1106,6 +1282,27 @@ class OrderDetailFetcher:
         )
         return ranked_candidates[0] if ranked_candidates else None
 
+    def _get_ranked_captured_sku_candidates(self) -> List[Dict[str, Any]]:
+        if not self._captured_sku_candidates:
+            return []
+
+        deduped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for candidate in self._captured_sku_candidates:
+            dedupe_key = (
+                str(candidate.get('sku_text', '')),
+                str(candidate.get('quantity', '')),
+                str(candidate.get('path', '')),
+            )
+            existing = deduped.get(dedupe_key)
+            if existing is None or candidate.get('score', 0) > existing.get('score', 0):
+                deduped[dedupe_key] = candidate
+
+        return sorted(
+            deduped.values(),
+            key=lambda item: (item.get('score', 0), len(str(item.get('sku_text', '')))),
+            reverse=True,
+        )
+
     async def _extract_amount_from_structured_content(self) -> Tuple[Optional[str], str]:
         await self._wait_for_response_capture_tasks(timeout=1.5)
 
@@ -1167,30 +1364,30 @@ class OrderDetailFetcher:
     async def _extract_sku_from_structured_content(self) -> Dict[str, str]:
         await self._wait_for_response_capture_tasks(timeout=1.5)
 
-        best_candidate = self._get_best_captured_sku_candidate()
-        if not best_candidate:
-            return {}
+        for candidate in self._get_ranked_captured_sku_candidates():
+            sku_text = str(candidate.get('sku_text') or '').strip()
+            if not sku_text:
+                continue
 
-        sku_text = str(best_candidate.get('sku_text') or '').strip()
-        if not sku_text:
-            return {}
+            parsed = self._parse_sku_content(sku_text)
+            if not parsed:
+                continue
 
-        parsed = self._parse_sku_content(sku_text)
-        if not parsed:
-            return {}
+            sanitized = self._sanitize_sku_result(parsed, source='structured_response_candidate')
+            if not (sanitized.get('spec_name') and sanitized.get('spec_value')):
+                continue
 
-        sanitized = self._sanitize_sku_result(parsed, source='structured_response_candidate')
-        quantity = self._normalize_quantity_text(best_candidate.get('quantity'))
-        if quantity:
-            sanitized['quantity'] = quantity
+            quantity = self._normalize_quantity_text(candidate.get('quantity'))
+            if quantity:
+                sanitized['quantity'] = quantity
 
-        if sanitized:
             logger.info(
                 f"采用结构化响应规格候选: sku={sku_text}, quantity={quantity or ''}, "
-                f"path={best_candidate.get('path')}"
+                f"path={candidate.get('path')}"
             )
+            return sanitized
 
-        return sanitized
+        return {}
 
     async def _extract_amount_from_semantic_blocks(self) -> Tuple[Optional[str], str]:
         semantic_keywords = [
@@ -1492,6 +1689,10 @@ class OrderDetailFetcher:
             r'^发货方式$',
             r'^安装方式$',
             r'^接口$',
+            r'^地区$',
+            r'^区域$',
+            r'^省份$',
+            r'^城市$',
             r'^选项\d*$',
             r'^属性\d*$',
             r'^服务器$',
@@ -1539,7 +1740,10 @@ class OrderDetailFetcher:
         if any(token in lower_value for token in invalid_tokens):
             return False
 
-        if strict and not self._is_text_fallback_spec_name_like(name):
+        if strict and not (
+            self._is_text_fallback_spec_name_like(name) or
+            self._is_numeric_index_spec_name_like(name, value)
+        ):
             return False
 
         return True
@@ -2032,6 +2236,102 @@ class OrderDetailFetcher:
         except Exception as e:
             logger.error(f"获取订单状态异常: {e}")
             return 'unknown'
+
+    def _extract_labeled_datetime_from_text(self, text: str, labels: List[str]) -> Optional[str]:
+        if not text:
+            return None
+
+        normalized_text = str(text).replace('\u3000', ' ')
+        datetime_pattern = (
+            r'(\d{4}\s*(?:年|[-/.])\s*\d{1,2}\s*(?:月|[-/.])\s*\d{1,2}'
+            r'\s*(?:日)?\s*(?:T|\s+)\s*\d{1,2}\s*:\s*\d{1,2}(?:\s*:\s*\d{1,2})?)'
+        )
+        for label in labels:
+            for pattern in (
+                rf'{re.escape(label)}\s*[:：]?\s*{datetime_pattern}',
+                rf'{re.escape(label)}[^\d]{{0,8}}{datetime_pattern}',
+            ):
+                match = re.search(pattern, normalized_text, re.IGNORECASE | re.S)
+                if not match:
+                    continue
+                parsed = parse_local_datetime_text_to_db_utc(match.group(1))
+                if parsed:
+                    return parsed
+        return None
+
+    def _extract_order_time_fields_from_text(self, text: str) -> Dict[str, str]:
+        if not text:
+            return {}
+
+        result: Dict[str, str] = {}
+        field_label_map = {
+            'platform_created_at': ['创建时间', '下单时间'],
+            'platform_paid_at': ['付款时间', '支付时间'],
+            'platform_completed_at': ['成交时间', '完成时间', '确认收货时间'],
+        }
+
+        for field_name, labels in field_label_map.items():
+            parsed_value = self._extract_labeled_datetime_from_text(text, labels)
+            if parsed_value:
+                result[field_name] = parsed_value
+
+        return result
+
+    async def _get_order_time_fields(self) -> Dict[str, str]:
+        labels = ['创建时间', '下单时间', '付款时间', '支付时间', '成交时间', '完成时间', '确认收货时间']
+        candidate_texts: List[str] = []
+
+        page_text = await self._get_page_text()
+        if page_text:
+            candidate_texts.append(page_text)
+
+        try:
+            text_blocks = await self.page.evaluate(
+                """(labels) => {
+                    const nodes = Array.from(document.querySelectorAll('div, span, p, li, section, article'));
+                    const results = [];
+                    const seen = new Set();
+                    for (const node of nodes) {
+                        const text = String(node.innerText || node.textContent || '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+                        if (!text || text.length < 8 || text.length > 120) {
+                            continue;
+                        }
+                        if (!/\\d{4}/.test(text)) {
+                            continue;
+                        }
+                        if (!labels.some((label) => text.includes(label))) {
+                            continue;
+                        }
+                        if (seen.has(text)) {
+                            continue;
+                        }
+                        seen.add(text);
+                        results.push(text);
+                        if (results.length >= 24) {
+                            break;
+                        }
+                    }
+                    return results;
+                }""",
+                labels,
+            )
+            candidate_texts.extend(text_blocks or [])
+        except Exception as e:
+            logger.debug(f"提取订单时间文本块失败: {e}")
+
+        merged_result: Dict[str, str] = {}
+        for candidate_text in candidate_texts:
+            extracted_fields = self._extract_order_time_fields_from_text(candidate_text)
+            for field_name, field_value in extracted_fields.items():
+                if field_value and field_name not in merged_result:
+                    merged_result[field_name] = field_value
+
+        if merged_result:
+            logger.info(f"提取到订单平台时间字段: {merged_result}")
+
+        return merged_result
 
     async def _get_sku_content(self) -> Optional[Dict[str, str]]:
         """获取并解析SKU内容，包括规格、数量和金额，支持双规格"""

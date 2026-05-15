@@ -10,7 +10,7 @@ import re
 import aiohttp
 import io
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from urllib.parse import parse_qs, urlparse
@@ -324,6 +324,7 @@ class DBManager:
                 user_id INTEGER NOT NULL,
                 auto_confirm INTEGER DEFAULT 1,
                 remark TEXT DEFAULT '',
+                status_note TEXT DEFAULT '',
                 pause_duration INTEGER DEFAULT 10,
                 username TEXT DEFAULT '',
                 password TEXT DEFAULT '',
@@ -463,6 +464,9 @@ class DBManager:
                 bargain_success_detected INTEGER DEFAULT 0,
                 order_status TEXT DEFAULT 'unknown',
                 pre_refund_status TEXT,
+                platform_created_at TIMESTAMP,
+                platform_paid_at TIMESTAMP,
+                platform_completed_at TIMESTAMP,
                 cookie_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -852,14 +856,14 @@ class DBManager:
 时间: {time}
 
 请及时处理！'),
-            ('slider_success', '✅ 滑块验证成功，cookies已自动更新到数据库
+            ('slider_success', '✅ 滑块验证成功，{status_text}
 
 账号: {account_id}
 时间: {time}'),
-            ('face_verify', '⚠️ 需要{verification_type}或登录出错 🚫
+            ('face_verify', '⚠️ 需要{verification_type} 🚫
 在验证期间，发货及自动回复暂时无法使用。
 
-请点击验证链接完成验证:
+{verification_action}
 {verification_url}
 
 账号: {account_id}
@@ -934,6 +938,11 @@ Cookie数量: {cookie_count}
                 cursor.execute("ALTER TABLE cookies ADD COLUMN remark TEXT DEFAULT ''")
                 logger.info("数据库迁移完成：添加remark列")
 
+            if 'status_note' not in cookie_columns:
+                logger.info("添加cookies表的status_note列...")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN status_note TEXT DEFAULT ''")
+                logger.info("数据库迁移完成：添加status_note列")
+
             # 检查cookies表是否存在pause_duration列
             if 'pause_duration' not in cookie_columns:
                 logger.info("添加cookies表的pause_duration列...")
@@ -945,6 +954,9 @@ Cookie数量: {cookie_count}
                 logger.info("添加cookies表的auto_comment列...")
                 cursor.execute("ALTER TABLE cookies ADD COLUMN auto_comment INTEGER DEFAULT 0")
                 logger.info("数据库迁移完成：添加auto_comment列")
+
+            # 历史版本可能缺少订单平台时间字段，不能再依赖旧版本号分支触发
+            self._ensure_orders_platform_time_columns(cursor)
 
             # 迁移notification_templates表以支持新的模板类型
             self._migrate_notification_templates(cursor)
@@ -989,6 +1001,15 @@ Cookie数量: {cookie_count}
             logger.error(f"数据库迁移失败: {e}")
             # 迁移失败不应该阻止程序启动
             pass
+
+    def _ensure_orders_platform_time_columns(self, cursor):
+        """确保 orders 表存在平台时间字段。"""
+        for order_time_column in ("platform_created_at", "platform_paid_at", "platform_completed_at"):
+            try:
+                self._execute_sql(cursor, f"SELECT {order_time_column} FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                self._execute_sql(cursor, f"ALTER TABLE orders ADD COLUMN {order_time_column} TIMESTAMP")
+                logger.info(f"为orders表添加平台时间字段({order_time_column})")
 
     def _update_cards_table_constraints(self, cursor):
         """更新cards表的CHECK约束以支持image和yifan_api类型"""
@@ -1095,14 +1116,14 @@ Cookie数量: {cookie_count}
                 # 插入新的默认模板（包括之前可能缺失的）
                 cursor.execute('''
                 INSERT OR IGNORE INTO notification_templates (type, template) VALUES
-                ('slider_success', '✅ 滑块验证成功，cookies已自动更新到数据库
+                ('slider_success', '✅ 滑块验证成功，{status_text}
 
 账号: {account_id}
 时间: {time}'),
-                ('face_verify', '⚠️ 需要{verification_type}或登录出错 🚫
+                ('face_verify', '⚠️ 需要{verification_type} 🚫
 在验证期间，发货及自动回复暂时无法使用。
 
-请点击验证链接完成验证:
+{verification_action}
 {verification_url}
 
 账号: {account_id}
@@ -1123,7 +1144,25 @@ Cookie数量: {cookie_count}
 账号已可正常使用。')
                 ''')
 
-                logger.info("通知模板类型迁移完成")
+            old_slider_success_template = '''✅ 滑块验证成功，cookies已自动更新到数据库
+
+账号: {account_id}
+时间: {time}'''
+            new_slider_success_template = '''✅ 滑块验证成功，{status_text}
+
+账号: {account_id}
+时间: {time}'''
+            self._execute_sql(
+                cursor,
+                '''
+                UPDATE notification_templates
+                SET template = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE type = 'slider_success' AND template = ?
+                ''',
+                (new_slider_success_template, old_slider_success_template)
+            )
+
+            logger.info("通知模板类型迁移完成")
         except Exception as e:
             logger.warning(f"迁移notification_templates表时出错（可能表不存在）: {e}")
             # 如果迁移失败，尝试清理
@@ -1325,6 +1364,8 @@ Cookie数量: {cookie_count}
                     self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN spec_name_2 TEXT")
                     self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN spec_value_2 TEXT")
                     logger.info("为orders表添加双规格字段(spec_name_2, spec_value_2)")
+
+                self._ensure_orders_platform_time_columns(cursor)
 
                 # 为item_info表添加多规格字段（如果不存在）
                 try:
@@ -1888,30 +1929,39 @@ Cookie数量: {cookie_count}
     
     # -------------------- Cookie操作 --------------------
     def save_cookie(self, cookie_id: str, cookie_value: str, user_id: int = None) -> bool:
-        """保存Cookie到数据库，如存在则更新"""
+        """保存Cookie到数据库；已有记录仅更新Cookie值和用户绑定，保留其他账号字段"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
 
-                # 如果没有提供user_id，尝试从现有记录获取，否则使用admin用户ID
+                self._execute_sql(cursor, "SELECT user_id FROM cookies WHERE id = ?", (cookie_id,))
+                existing = cursor.fetchone()
+
+                # 如果没有提供user_id，优先沿用现有绑定，否则回落到admin用户
                 if user_id is None:
-                    self._execute_sql(cursor, "SELECT user_id FROM cookies WHERE id = ?", (cookie_id,))
-                    existing = cursor.fetchone()
                     if existing:
                         user_id = existing[0]
                     else:
-                        # 获取admin用户ID作为默认值
                         self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
                         admin_user = cursor.fetchone()
                         user_id = admin_user[0] if admin_user else 1
 
-                self._execute_sql(cursor,
-                    "INSERT OR REPLACE INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
-                    (cookie_id, self._encrypt_secret(cookie_value), user_id)
-                )
+                encrypted_cookie_value = self._encrypt_secret(cookie_value)
+                if existing:
+                    self._execute_sql(cursor,
+                        "UPDATE cookies SET value = ?, user_id = ? WHERE id = ?",
+                        (encrypted_cookie_value, user_id, cookie_id)
+                    )
+                    action = "更新"
+                else:
+                    self._execute_sql(cursor,
+                        "INSERT INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
+                        (cookie_id, encrypted_cookie_value, user_id)
+                    )
+                    action = "创建"
 
                 self.conn.commit()
-                logger.info(f"Cookie保存成功: {cookie_id} (用户ID: {user_id})")
+                logger.info(f"Cookie{action}成功: {cookie_id} (用户ID: {user_id})")
 
                 # 验证保存结果
                 self._execute_sql(cursor, "SELECT user_id FROM cookies WHERE id = ?", (cookie_id,))
@@ -2000,37 +2050,38 @@ Cookie数量: {cookie_count}
                 return None
 
     def get_cookie_details(self, cookie_id: str) -> Optional[Dict[str, any]]:
-        """获取Cookie的详细信息，包括user_id、auto_confirm、remark、pause_duration、username、password、show_browser和代理配置"""
+        """获取Cookie的详细信息，包括备注、状态文案、暂停时间、账号信息和代理配置"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, """
-                    SELECT id, value, user_id, auto_confirm, remark, pause_duration, 
-                           username, password, show_browser, created_at,
+                    SELECT id, value, user_id, auto_confirm, remark, status_note,
+                           pause_duration, username, password, show_browser, created_at,
                            proxy_type, proxy_host, proxy_port, proxy_user, proxy_pass
                     FROM cookies WHERE id = ?
                 """, (cookie_id,))
                 result = cursor.fetchone()
                 if result:
                     cookie_value = self._decrypt_secret(result[1])
-                    password = self._decrypt_secret(result[7])
-                    proxy_pass = self._decrypt_secret(result[14])
+                    password = self._decrypt_secret(result[8])
+                    proxy_pass = self._decrypt_secret(result[15])
                     return {
                         'id': result[0],
                         'value': cookie_value,
                         'user_id': result[2],
                         'auto_confirm': bool(result[3]),
                         'remark': result[4] or '',
-                        'pause_duration': result[5] if result[5] is not None else 10,  # 0是有效值，表示不暂停
-                        'username': result[6] or '',
+                        'status_note': result[5] or '',
+                        'pause_duration': result[6] if result[6] is not None else 10,  # 0是有效值，表示不暂停
+                        'username': result[7] or '',
                         'password': password,
-                        'show_browser': bool(result[8]) if result[8] is not None else False,
-                        'created_at': result[9],
+                        'show_browser': bool(result[9]) if result[9] is not None else False,
+                        'created_at': result[10],
                         # 代理配置
-                        'proxy_type': result[10] or 'none',
-                        'proxy_host': result[11] or '',
-                        'proxy_port': result[12] or 0,
-                        'proxy_user': result[13] or '',
+                        'proxy_type': result[11] or 'none',
+                        'proxy_host': result[12] or '',
+                        'proxy_port': result[13] or 0,
+                        'proxy_user': result[14] or '',
                         'proxy_pass': proxy_pass
                     }
                 return None
@@ -2062,6 +2113,19 @@ Cookie数量: {cookie_count}
                 return True
             except Exception as e:
                 logger.error(f"更新账号备注失败: {e}")
+                return False
+
+    def update_cookie_status_note(self, cookie_id: str, status_note: str) -> bool:
+        """更新Cookie的状态说明文案"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "UPDATE cookies SET status_note = ? WHERE id = ?", (status_note, cookie_id))
+                self.conn.commit()
+                logger.info(f"更新账号 {cookie_id} 状态文案: {status_note}")
+                return True
+            except Exception as e:
+                logger.error(f"更新账号状态文案失败: {e}")
                 return False
 
     def update_cookie_pause_duration(self, cookie_id: str, pause_duration: int) -> bool:
@@ -3465,14 +3529,14 @@ Cookie数量: {cookie_count}
 时间: {time}
 
 请及时处理！''',
-            'slider_success': '''✅ 滑块验证成功，cookies已自动更新到数据库
+            'slider_success': '''✅ 滑块验证成功，{status_text}
 
 账号: {account_id}
 时间: {time}''',
-            'face_verify': '''⚠️ 需要{verification_type}或登录出错 🚫
+            'face_verify': '''⚠️ 需要{verification_type} 🚫
 在验证期间，发货及自动回复暂时无法使用。
 
-请点击验证链接完成验证:
+{verification_action}
 {verification_url}
 
 账号: {account_id}
@@ -3528,14 +3592,14 @@ Cookie数量: {cookie_count}
 时间: {time}
 
 请及时处理！''',
-            'slider_success': '''✅ 滑块验证成功，cookies已自动更新到数据库
+            'slider_success': '''✅ 滑块验证成功，{status_text}
 
 账号: {account_id}
 时间: {time}''',
-            'face_verify': '''⚠️ 需要{verification_type}或登录出错 🚫
+            'face_verify': '''⚠️ 需要{verification_type} 🚫
 在验证期间，发货及自动回复暂时无法使用。
 
-请点击验证链接完成验证:
+{verification_action}
 {verification_url}
 
 账号: {account_id}
@@ -6592,21 +6656,30 @@ Cookie数量: {cookie_count}
                 return [], []
 
     # 已知的无效 buyer_id 占位值
-    _INVALID_BUYER_IDS = {"unknown_user", "unknown", "", "None", "null"}
+    _INVALID_BUYER_IDS = {"unknown_user", "unknown", "", "None", "null", "0", "-", "-1"}
 
     @staticmethod
     def _is_valid_buyer_id(buyer_id) -> bool:
         """检查 buyer_id 是否为有效值（非占位符）"""
         if not buyer_id:
             return False
-        return str(buyer_id).strip() not in DBManager._INVALID_BUYER_IDS
+        normalized_buyer_id = str(buyer_id).strip()
+        if normalized_buyer_id.endswith('@goofish'):
+            normalized_buyer_id = normalized_buyer_id.split('@')[0].strip()
+        if normalized_buyer_id in DBManager._INVALID_BUYER_IDS:
+            return False
+        if normalized_buyer_id.isdigit() and len(normalized_buyer_id) <= 2:
+            return False
+        return True
 
     def insert_or_update_order(self, order_id: str, item_id: str = None, buyer_id: str = None,
                               spec_name: str = None, spec_value: str = None, quantity: str = None,
                               amount: str = None, order_status: str = None, cookie_id: str = None,
                               sid: str = None, spec_name_2: str = None, spec_value_2: str = None,
                               buyer_nick: str = None, pre_refund_status=..., clear_pre_refund_status: bool = False,
-                              bargain_flow_detected=..., bargain_success_detected=...):
+                              bargain_flow_detected=..., bargain_success_detected=...,
+                              platform_created_at: str = None, platform_paid_at: str = None,
+                              platform_completed_at: str = None):
         """插入或更新订单信息
 
         Args:
@@ -6700,6 +6773,15 @@ Cookie数量: {cookie_count}
                     if cookie_id is not None:
                         update_fields.append("cookie_id = ?")
                         update_values.append(cookie_id)
+                    if platform_created_at is not None:
+                        update_fields.append("platform_created_at = ?")
+                        update_values.append(platform_created_at)
+                    if platform_paid_at is not None:
+                        update_fields.append("platform_paid_at = ?")
+                        update_values.append(platform_paid_at)
+                    if platform_completed_at is not None:
+                        update_fields.append("platform_completed_at = ?")
+                        update_values.append(platform_completed_at)
 
                     if update_fields:
                         update_fields.append("updated_at = CURRENT_TIMESTAMP")
@@ -6726,6 +6808,15 @@ Cookie数量: {cookie_count}
                     if bargain_success_detected is not ...:
                         insert_fields.append('bargain_success_detected')
                         insert_values.append(1 if bargain_success_detected else 0)
+                    if platform_created_at is not None:
+                        insert_fields.append('platform_created_at')
+                        insert_values.append(platform_created_at)
+                    if platform_paid_at is not None:
+                        insert_fields.append('platform_paid_at')
+                        insert_values.append(platform_paid_at)
+                    if platform_completed_at is not None:
+                        insert_fields.append('platform_completed_at')
+                        insert_values.append(platform_completed_at)
 
                     if has_pre_refund_status and not clear_pre_refund_status:
                         insert_fields.append('pre_refund_status')
@@ -6751,7 +6842,9 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
-                       spec_name_2, spec_value_2, quantity, amount, bargain_flow_detected, bargain_success_detected, order_status, pre_refund_status, cookie_id, created_at, updated_at
+                       spec_name_2, spec_value_2, quantity, amount, bargain_flow_detected, bargain_success_detected,
+                       order_status, pre_refund_status, cookie_id, platform_created_at, platform_paid_at,
+                       platform_completed_at, created_at, updated_at
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -6774,8 +6867,11 @@ Cookie数量: {cookie_count}
                         'order_status': row[13],
                         'pre_refund_status': row[14],
                         'cookie_id': row[15],
-                        'created_at': row[16],
-                        'updated_at': row[17]
+                        'platform_created_at': row[16],
+                        'platform_paid_at': row[17],
+                        'platform_completed_at': row[18],
+                        'created_at': row[19],
+                        'updated_at': row[20]
                     }
                 return None
 
@@ -6804,7 +6900,8 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
-                       spec_name_2, spec_value_2, quantity, amount, order_status, created_at, updated_at
+                       spec_name_2, spec_value_2, quantity, amount, order_status,
+                       platform_created_at, platform_paid_at, platform_completed_at, created_at, updated_at
                 FROM orders WHERE cookie_id = ?
                 ORDER BY created_at DESC LIMIT ?
                 ''', (cookie_id, limit))
@@ -6824,8 +6921,11 @@ Cookie数量: {cookie_count}
                         'quantity': row[9],
                         'amount': row[10],
                         'order_status': row[11],
-                        'created_at': row[12],
-                        'updated_at': row[13]
+                        'platform_created_at': row[12],
+                        'platform_paid_at': row[13],
+                        'platform_completed_at': row[14],
+                        'created_at': row[15],
+                        'updated_at': row[16]
                     })
 
                 return orders
@@ -7292,7 +7392,9 @@ Cookie数量: {cookie_count}
                 if has_yifan_fields:
                     cursor.execute('''
                     SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                           quantity, amount, order_status, cookie_id, created_at, updated_at,
+                           quantity, amount, order_status, cookie_id,
+                           platform_created_at, platform_paid_at, platform_completed_at,
+                           created_at, updated_at,
                            yifan_orderno, delivery_status, callback_data, chat_id
                     FROM orders WHERE order_id = ?
                     ''', (order_id,))
@@ -7309,18 +7411,23 @@ Cookie数量: {cookie_count}
                             'amount': row[6],
                             'order_status': row[7],
                             'cookie_id': row[8],
-                            'created_at': row[9],
-                            'updated_at': row[10],
-                            'yifan_orderno': row[11],
-                            'delivery_status': row[12],
-                            'callback_data': row[13],
-                            'chat_id': row[14]
+                            'platform_created_at': row[9],
+                            'platform_paid_at': row[10],
+                            'platform_completed_at': row[11],
+                            'created_at': row[12],
+                            'updated_at': row[13],
+                            'yifan_orderno': row[14],
+                            'delivery_status': row[15],
+                            'callback_data': row[16],
+                            'chat_id': row[17]
                         }
                 else:
                     # 使用旧的查询方式
                     cursor.execute('''
                     SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                           quantity, amount, order_status, cookie_id, created_at, updated_at
+                           quantity, amount, order_status, cookie_id,
+                           platform_created_at, platform_paid_at, platform_completed_at,
+                           created_at, updated_at
                     FROM orders WHERE order_id = ?
                     ''', (order_id,))
                     
@@ -7336,8 +7443,11 @@ Cookie数量: {cookie_count}
                             'amount': row[6],
                             'order_status': row[7],
                             'cookie_id': row[8],
-                            'created_at': row[9],
-                            'updated_at': row[10]
+                            'platform_created_at': row[9],
+                            'platform_paid_at': row[10],
+                            'platform_completed_at': row[11],
+                            'created_at': row[12],
+                            'updated_at': row[13]
                         }
                 
                 return None
@@ -7820,7 +7930,7 @@ Cookie数量: {cookie_count}
         if '扫码登录获取真实cookie' in description:
             return 'qr_login'
 
-        if event_type in {'face_verify', 'sms_verify', 'qr_verify', 'password_error'}:
+        if event_type in {'face_verify', 'sms_verify', 'qr_verify', 'unknown', 'password_error'}:
             return 'password_login'
 
         if '连续失败5次' in description or '关键api不可用' in lower_text or 'cookie验证失败' in description:
@@ -8320,7 +8430,7 @@ Cookie数量: {cookie_count}
             logger.error(f"获取风控日志数量失败: {e}")
             return 0
 
-    def get_slider_verification_session_stats(self, cookie_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    def get_slider_verification_session_stats(self, cookie_ids: Optional[List[str]] = None, range_key: str = 'all') -> Dict[str, Any]:
         """获取滑块验证会话级统计数据。"""
         empty_stats = {
             'has_data': False,
@@ -8334,7 +8444,11 @@ Cookie数量: {cookie_count}
             'recent_success': None,
             'recent_failure': None,
             'accounts_with_sessions': 0,
+            'accounts_with_failures': 0,
             'stats_mode': 'session',
+            'summary_text': '暂无滑块验证记录',
+            'selected_range': 'all',
+            'range_label': '所有',
         }
 
         def _normalize_cookie_ids(values: Optional[List[str]]) -> Optional[List[str]]:
@@ -8355,56 +8469,86 @@ Cookie数量: {cookie_count}
                 return None
             return text[:16]
 
+        def _normalize_range(value: Any) -> str:
+            text = str(value or '').strip().lower()
+            if text in {'today', '7d', 'all'}:
+                return text
+            return 'all'
+
+        def _build_range_filter(value: str) -> Tuple[List[str], List[Any], str]:
+            normalized = _normalize_range(value)
+            label_map = {
+                'today': '当日',
+                '7d': '近 7 天',
+                'all': '所有',
+            }
+            if normalized == 'all':
+                return [], [], label_map[normalized]
+
+            beijing_tz = timezone(timedelta(hours=8))
+            now_local = datetime.now(beijing_tz)
+            days_back = 0 if normalized == 'today' else 6
+            start_local = (now_local - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0)
+            start_utc = start_local.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            return ["datetime(created_at) >= datetime(?)"], [start_utc], label_map[normalized]
+
         try:
             normalized_cookie_ids = _normalize_cookie_ids(cookie_ids)
+            normalized_range = _normalize_range(range_key)
             if cookie_ids is not None and not normalized_cookie_ids:
-                return dict(empty_stats)
+                empty_result = dict(empty_stats)
+                empty_result.update({
+                    'selected_range': normalized_range,
+                    'range_label': _build_range_filter(normalized_range)[2],
+                })
+                return empty_result
 
             with self.lock:
                 cursor = self.conn.cursor()
 
-                base_conditions = [
-                    "event_type = ?",
-                    "session_id IS NOT NULL",
-                    "trim(session_id) != ''",
-                ]
-                base_params: List[Any] = ['slider_captcha']
+                scope_conditions: List[str] = []
+                scope_params: List[Any] = []
 
                 if normalized_cookie_ids is not None:
                     placeholders = ', '.join(['?'] * len(normalized_cookie_ids))
-                    base_conditions.append(f"cookie_id IN ({placeholders})")
-                    base_params.extend(normalized_cookie_ids)
+                    scope_conditions.append(f"cookie_id IN ({placeholders})")
+                    scope_params.extend(normalized_cookie_ids)
 
-                where_clause = ' WHERE ' + ' AND '.join(base_conditions)
+                range_conditions, range_params, range_label = _build_range_filter(normalized_range)
+                scope_conditions.extend(range_conditions)
+                scope_params.extend(range_params)
+
+                where_clause = ''
+                if scope_conditions:
+                    where_clause = ' WHERE ' + ' AND '.join(scope_conditions)
 
                 cursor.execute(
                     f'''
                     SELECT
-                        COUNT(*) AS total_sessions,
-                        COALESCE(SUM(CASE WHEN processing_status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
-                        COALESCE(SUM(CASE WHEN processing_status = 'failed' THEN 1 ELSE 0 END), 0) AS failure_count,
-                        COALESCE(SUM(CASE WHEN processing_status = 'processing' THEN 1 ELSE 0 END), 0) AS processing_count,
-                        COUNT(DISTINCT cookie_id) AS accounts_with_sessions
+                        COALESCE(SUM(CASE WHEN event_type = 'slider_captcha' AND processing_status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+                        COALESCE(SUM(CASE WHEN ((event_type = 'slider_captcha' AND processing_status = 'failed') OR result_code = 'password_login_slider_failed') THEN 1 ELSE 0 END), 0) AS failure_count,
+                        COALESCE(SUM(CASE WHEN event_type = 'slider_captcha' AND processing_status = 'processing' THEN 1 ELSE 0 END), 0) AS processing_count,
+                        COUNT(DISTINCT CASE WHEN (event_type = 'slider_captcha' OR result_code = 'password_login_slider_failed') THEN cookie_id END) AS accounts_with_sessions
                     FROM risk_control_logs
                     {where_clause}
                     ''',
-                    base_params,
+                    scope_params,
                 )
-                row = cursor.fetchone() or (0, 0, 0, 0, 0)
+                row = cursor.fetchone() or (0, 0, 0, 0)
 
-                total_sessions = int(row[0] or 0)
-                success_count = int(row[1] or 0)
-                failure_count = int(row[2] or 0)
-                processing_count = int(row[3] or 0)
-                accounts_with_sessions = int(row[4] or 0)
+                success_count = int(row[0] or 0)
+                failure_count = int(row[1] or 0)
+                processing_count = int(row[2] or 0)
+                accounts_with_sessions = int(row[3] or 0)
                 completed_sessions = success_count + failure_count
+                total_sessions = completed_sessions + processing_count
                 success_rate = round((success_count / completed_sessions) * 100, 1) if completed_sessions > 0 else 0.0
 
-                def _fetch_recent_datetime(status_value: str) -> Optional[str]:
-                    conditions = list(base_conditions)
-                    params = list(base_params)
-                    conditions.append("processing_status = ?")
-                    params.append(status_value)
+                def _fetch_recent_datetime(extra_condition: str, extra_params: List[Any]) -> Optional[str]:
+                    conditions = list(scope_conditions)
+                    params = list(scope_params)
+                    conditions.append(extra_condition)
+                    params.extend(extra_params)
                     recent_where = ' WHERE ' + ' AND '.join(conditions)
 
                     cursor.execute(
@@ -8420,6 +8564,14 @@ Cookie数量: {cookie_count}
                     row = cursor.fetchone()
                     return _format_datetime_text(row[0] if row else None)
 
+                if total_sessions > 0:
+                    if normalized_range == 'all':
+                        summary_text = '已包含全部时间的滑块成功/失败，并将账密刷新中的滑块失败计入失败次数'
+                    else:
+                        summary_text = f'已按{range_label}范围统计滑块成功/失败，并将账密刷新中的滑块失败计入失败次数'
+                else:
+                    summary_text = '暂无滑块验证记录' if normalized_range == 'all' else f'{range_label}暂无滑块验证记录'
+
                 return {
                     'has_data': total_sessions > 0,
                     'total_sessions': total_sessions,
@@ -8429,14 +8581,26 @@ Cookie数量: {cookie_count}
                     'processing_count': processing_count,
                     'completed_sessions': completed_sessions,
                     'success_rate': success_rate,
-                    'recent_success': _fetch_recent_datetime('success'),
-                    'recent_failure': _fetch_recent_datetime('failed'),
+                    'recent_success': _fetch_recent_datetime("event_type = ? AND processing_status = ?", ['slider_captcha', 'success']),
+                    'recent_failure': _fetch_recent_datetime("((event_type = ? AND processing_status = ?) OR result_code = ?)", ['slider_captcha', 'failed', 'password_login_slider_failed']),
                     'accounts_with_sessions': accounts_with_sessions,
+                    'accounts_with_failures': accounts_with_sessions,
                     'stats_mode': 'session',
+                    'summary_text': summary_text,
+                    'selected_range': normalized_range,
+                    'range_label': range_label,
                 }
         except Exception as e:
-            logger.error(f"获取滑块验证会话统计失败: {e}")
-            return dict(empty_stats)
+            logger.error(f"获取滑块验证统计失败: {e}")
+            empty_result = dict(empty_stats)
+            normalized_range = str(range_key or '').strip().lower()
+            if normalized_range in {'today', '7d'}:
+                empty_result.update({
+                    'selected_range': normalized_range,
+                    'range_label': '当日' if normalized_range == 'today' else '近 7 天',
+                    'summary_text': '当日暂无滑块验证记录' if normalized_range == 'today' else '近 7 天暂无滑块验证记录',
+                })
+            return empty_result
 
     def delete_risk_control_log(self, log_id: int) -> bool:
         """

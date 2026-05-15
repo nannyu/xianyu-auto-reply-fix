@@ -1,5 +1,6 @@
 API_ENDPOINTS:
   login_check: https://passport.goofish.com/newlogin/hasLogin.do
+  login_user: https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.loginuser.get/1.0/
   message_headinfo: https://h5api.m.goofish.com/h5/mtop.idle.trade.pc.message.headinfo/1.0/
   token: https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/
 APP_CONFIG:
@@ -61,8 +62,10 @@ MANUAL_MODE:
   timeout: 3600
   toggle_keywords: []
 MESSAGE_EXPIRE_TIME: 300000
-TOKEN_REFRESH_INTERVAL: 3600  # 从3600秒(1小时)增加到72000秒(20小时)
-TOKEN_RETRY_INTERVAL: 600    # 从300秒(5分钟)增加到7200秒(2小时)
+TOKEN_REFRESH_INTERVAL: 72000  # AccessToken 仅在初始化/重连前按需刷新，默认20小时
+TOKEN_RETRY_INTERVAL: 600
+SESSION_KEEPALIVE_INTERVAL: 600  # 使用 loginuser.get 的轻量保活周期，默认10分钟
+SESSION_KEEPALIVE_RETRY_INTERVAL: 180  # 轻量保活失败后的重试间隔，默认3分钟
 SLIDER_VERIFICATION:
   max_concurrent: 3  # 滑块验证最大并发数
   wait_timeout: 60   # 等待排队超时时间（秒）
