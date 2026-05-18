@@ -296,12 +296,13 @@ build/
 !CONTRIBUTING.md
 !SECURITY.md
 !LICENSE.md
-!docs/*.md
 
 # 临时配置文件
 *.local.yml
 *.dev.yml
 *.test.yml
+tmp_remote_debug/
+debug_*.jpg
 config.*.yml
 !global_config.yml
 
@@ -812,3 +813,4 @@ utils/ws_utils.py
 secure_confirm_ultra.py
 secure_freeshipping_ultra.py
 test_php_stats.py
+.playwright-browsers/

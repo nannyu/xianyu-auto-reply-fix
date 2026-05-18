@@ -325,6 +325,7 @@ class DBManager:
                 auto_confirm INTEGER DEFAULT 1,
                 remark TEXT DEFAULT '',
                 status_note TEXT DEFAULT '',
+                qr_login_grace_until INTEGER DEFAULT 0,
                 pause_duration INTEGER DEFAULT 10,
                 username TEXT DEFAULT '',
                 password TEXT DEFAULT '',
@@ -694,6 +695,28 @@ class DBManager:
                 )
             ''')
 
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                sender_id TEXT,
+                sender_name TEXT,
+                content TEXT,
+                content_type INTEGER DEFAULT 1,
+                image_url TEXT,
+                item_id TEXT,
+                direction INTEGER DEFAULT 2,
+                reply_source TEXT,
+                media_url TEXT,
+                link_url TEXT,
+                extra_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_chat_messages_lookup ON chat_messages(cookie_id, chat_id, created_at)")
+
             # 创建默认回复记录表（记录已回复的chat_id）
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS default_reply_records (
@@ -799,7 +822,7 @@ class DBManager:
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS notification_templates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type TEXT NOT NULL UNIQUE CHECK (type IN ('message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success')),
+                type TEXT NOT NULL UNIQUE CHECK (type IN ('message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success', 'account_paused')),
                 template TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -881,7 +904,18 @@ Cookie数量: {cookie_count}
 时间: {time}
 Cookie数量: {cookie_count}
 
-账号已可正常使用。')
+账号已可正常使用。'),
+            ('account_paused', '🚫 账号已暂停
+
+账号: {account_id}
+状态: {status_note}
+原因: {pause_reason}
+时间: {time}
+
+说明: {error_message}
+验证入口: {verification_url}
+
+{action_hint}')
             ''')
 
             # 插入默认系统设置（不包括管理员密码，由reply_server.py初始化）
@@ -891,6 +925,9 @@ Cookie数量: {cookie_count}
             ('registration_enabled', 'true', '是否开启用户注册'),
             ('show_default_login_info', 'true', '是否显示默认登录信息'),
             ('login_captcha_enabled', 'true', '是否开启登录验证码'),
+            ('risk_control_night_mode_enabled', 'false', '是否启用夜间风控降频'),
+            ('risk_control_night_start_hour', '1', '夜间风控降频开始小时'),
+            ('risk_control_night_end_hour', '6', '夜间风控降频结束小时'),
             ('smtp_server', '', 'SMTP服务器地址'),
             ('smtp_port', '587', 'SMTP端口'),
             ('smtp_user', '', 'SMTP登录用户名（发件邮箱）'),
@@ -898,6 +935,9 @@ Cookie数量: {cookie_count}
             ('smtp_from', '', '发件人显示名（留空则使用邮箱地址）'),
             ('smtp_use_tls', 'true', '是否启用TLS'),
             ('smtp_use_ssl', 'false', '是否启用SSL'),
+            ('verification_email_api_url', '', '验证码邮件 API 地址（留空则仅使用 SMTP，不再向旧硬编码地址外发）'),
+            ('qq_notification_api_url', '', 'QQ 私信通知 API 地址（留空则禁用 QQ 私信通知）'),
+            ('auto_comment_api_url', '', '自动好评辅助 API 地址（留空则禁用此功能，避免 Cookie 外发）'),
             ('qq_reply_secret_key', 'xianyu_qq_reply_2024', 'QQ回复消息API秘钥')
             ''')
 
@@ -942,6 +982,11 @@ Cookie数量: {cookie_count}
                 logger.info("添加cookies表的status_note列...")
                 cursor.execute("ALTER TABLE cookies ADD COLUMN status_note TEXT DEFAULT ''")
                 logger.info("数据库迁移完成：添加status_note列")
+
+            if 'qr_login_grace_until' not in cookie_columns:
+                logger.info("添加cookies表的qr_login_grace_until列...")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN qr_login_grace_until INTEGER DEFAULT 0")
+                logger.info("数据库迁移完成：添加qr_login_grace_until列")
 
             # 检查cookies表是否存在pause_duration列
             if 'pause_duration' not in cookie_columns:
@@ -996,6 +1041,18 @@ Cookie数量: {cookie_count}
             self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_risk_control_logs_cookie_created ON risk_control_logs(cookie_id, created_at DESC)")
             self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_risk_control_logs_type_status_created ON risk_control_logs(event_type, processing_status, created_at DESC)")
             self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_risk_control_logs_session_id ON risk_control_logs(session_id)")
+
+            cursor.execute("PRAGMA table_info(chat_messages)")
+            chat_message_columns = [column[1] for column in cursor.fetchall()]
+            if 'media_url' not in chat_message_columns:
+                logger.info("添加chat_messages表的media_url列...")
+                cursor.execute("ALTER TABLE chat_messages ADD COLUMN media_url TEXT")
+            if 'link_url' not in chat_message_columns:
+                logger.info("添加chat_messages表的link_url列...")
+                cursor.execute("ALTER TABLE chat_messages ADD COLUMN link_url TEXT")
+            if 'extra_json' not in chat_message_columns:
+                logger.info("添加chat_messages表的extra_json列...")
+                cursor.execute("ALTER TABLE chat_messages ADD COLUMN extra_json TEXT")
 
         except Exception as e:
             logger.error(f"数据库迁移失败: {e}")
@@ -1085,16 +1142,18 @@ Cookie数量: {cookie_count}
     def _migrate_notification_templates(self, cursor):
         """迁移notification_templates表以支持新的模板类型"""
         try:
-            # 检查是否已存在cookie_refresh_success模板
-            cursor.execute("SELECT COUNT(*) FROM notification_templates WHERE type = 'cookie_refresh_success'")
-            if cursor.fetchone()[0] == 0:
-                logger.info("添加Cookie刷新成功通知模板...")
+            cursor.execute(
+                "SELECT COUNT(*) FROM notification_templates WHERE type IN ('cookie_refresh_success', 'account_paused')"
+            )
+            existing_template_count = cursor.fetchone()[0]
+            if existing_template_count < 2:
+                logger.info("补充通知模板类型，重建notification_templates约束...")
 
                 # 重建表以更新CHECK约束
                 cursor.execute('''
                 CREATE TABLE IF NOT EXISTS notification_templates_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    type TEXT NOT NULL UNIQUE CHECK (type IN ('message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success')),
+                    type TEXT NOT NULL UNIQUE CHECK (type IN ('message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success', 'account_paused')),
                     template TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1141,7 +1200,18 @@ Cookie数量: {cookie_count}
 时间: {time}
 Cookie数量: {cookie_count}
 
-账号已可正常使用。')
+账号已可正常使用。'),
+                ('account_paused', '🚫 账号已暂停
+
+账号: {account_id}
+状态: {status_note}
+原因: {pause_reason}
+时间: {time}
+
+说明: {error_message}
+验证入口: {verification_url}
+
+{action_hint}')
                 ''')
 
             old_slider_success_template = '''✅ 滑块验证成功，cookies已自动更新到数据库
@@ -2056,15 +2126,15 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, """
                     SELECT id, value, user_id, auto_confirm, remark, status_note,
-                           pause_duration, username, password, show_browser, created_at,
+                           qr_login_grace_until, pause_duration, username, password, show_browser, created_at,
                            proxy_type, proxy_host, proxy_port, proxy_user, proxy_pass
                     FROM cookies WHERE id = ?
                 """, (cookie_id,))
                 result = cursor.fetchone()
                 if result:
                     cookie_value = self._decrypt_secret(result[1])
-                    password = self._decrypt_secret(result[8])
-                    proxy_pass = self._decrypt_secret(result[15])
+                    password = self._decrypt_secret(result[9])
+                    proxy_pass = self._decrypt_secret(result[16])
                     return {
                         'id': result[0],
                         'value': cookie_value,
@@ -2072,16 +2142,17 @@ Cookie数量: {cookie_count}
                         'auto_confirm': bool(result[3]),
                         'remark': result[4] or '',
                         'status_note': result[5] or '',
-                        'pause_duration': result[6] if result[6] is not None else 10,  # 0是有效值，表示不暂停
-                        'username': result[7] or '',
+                        'qr_login_grace_until': int(result[6] or 0),
+                        'pause_duration': result[7] if result[7] is not None else 10,  # 0是有效值，表示不暂停
+                        'username': result[8] or '',
                         'password': password,
-                        'show_browser': bool(result[9]) if result[9] is not None else False,
-                        'created_at': result[10],
+                        'show_browser': bool(result[10]) if result[10] is not None else False,
+                        'created_at': result[11],
                         # 代理配置
-                        'proxy_type': result[11] or 'none',
-                        'proxy_host': result[12] or '',
-                        'proxy_port': result[13] or 0,
-                        'proxy_user': result[14] or '',
+                        'proxy_type': result[12] or 'none',
+                        'proxy_host': result[13] or '',
+                        'proxy_port': result[14] or 0,
+                        'proxy_user': result[15] or '',
                         'proxy_pass': proxy_pass
                     }
                 return None
@@ -2126,6 +2197,19 @@ Cookie数量: {cookie_count}
                 return True
             except Exception as e:
                 logger.error(f"更新账号状态文案失败: {e}")
+                return False
+
+    def set_cookie_qr_login_grace_until(self, cookie_id: str, grace_until: int) -> bool:
+        """更新账号扫码登录稳定期截止时间"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "UPDATE cookies SET qr_login_grace_until = ? WHERE id = ?", (int(grace_until or 0), cookie_id))
+                self.conn.commit()
+                logger.info(f"更新账号 {cookie_id} 扫码稳定期截止时间: {int(grace_until or 0)}")
+                return True
+            except Exception as e:
+                logger.error(f"更新账号扫码稳定期失败: {e}")
                 return False
 
     def update_cookie_pause_duration(self, cookie_id: str, pause_duration: int) -> bool:
@@ -3554,7 +3638,18 @@ Cookie数量: {cookie_count}
 时间: {time}
 Cookie数量: {cookie_count}
 
-账号已可正常使用。'''
+账号已可正常使用。''',
+            'account_paused': '''🚫 账号已暂停
+
+账号: {account_id}
+状态: {status_note}
+原因: {pause_reason}
+时间: {time}
+
+说明: {error_message}
+验证入口: {verification_url}
+
+{action_hint}'''
         }
 
         if template_type not in default_templates:
@@ -3617,7 +3712,18 @@ Cookie数量: {cookie_count}
 时间: {time}
 Cookie数量: {cookie_count}
 
-账号已可正常使用。'''
+账号已可正常使用。''',
+            'account_paused': '''🚫 账号已暂停
+
+账号: {account_id}
+状态: {status_note}
+原因: {pause_reason}
+时间: {time}
+
+说明: {error_message}
+验证入口: {verification_url}
+
+{action_hint}'''
         }
 
         return default_templates.get(template_type)
@@ -4250,8 +4356,11 @@ Cookie数量: {cookie_count}
         try:
             import aiohttp
 
-            # 使用GET请求发送邮件
-            api_url = "https://dy.zhinianboke.com/api/emailSend"
+            # 邮件 API 地址：从系统设置读取，未配置则拒绝调用以避免向未知第三方泄露
+            api_url = (self.get_system_setting('verification_email_api_url') or '').strip()
+            if not api_url:
+                logger.warning(f"未配置 verification_email_api_url，无法通过 API 渠道发送验证码邮件: {email}")
+                return False
             params = {
                 'subject': subject,
                 'receiveUser': email,
@@ -6672,6 +6781,54 @@ Cookie数量: {cookie_count}
             return False
         return True
 
+    def _sanitize_order_buyer_nick(self, buyer_nick: str = None) -> str:
+        """过滤订单买家昵称中的系统通知标题，避免订单列表展示“工作台通知”等文案。"""
+        if buyer_nick is None:
+            return None
+
+        text = str(buyer_nick).strip()
+        if not text:
+            return None
+
+        invalid_exact_titles = {
+            "订单",
+            "全部",
+            "交易消息",
+            "等待你发货",
+            "买家",
+            "工作台通知",
+            "我完成了评价",
+            "你人真不错，送你闲鱼小红花",
+            "卖家人不错？送Ta闲鱼小红花",
+            "快给ta一个评价吧～",
+            "快给ta一个评价吧~",
+        }
+        if text in invalid_exact_titles:
+            logger.info(f"忽略系统标题型订单买家昵称: {text}")
+            return None
+
+        invalid_keywords = (
+            "小红花", "待付款", "待发货", "待刀成", "成功小刀", "闲鱼",
+            "交易", "收货", "退款", "评价", "发货", "付款", "拍下",
+            "确认", "关闭", "鼓励", "真不错", "全部", "订单",
+        )
+        if any(keyword in text for keyword in invalid_keywords):
+            logger.info(f"忽略系统关键词型订单买家昵称: {text}")
+            return None
+
+        return text
+
+    def _resolve_order_buyer_nick_for_write(self, order_id: str, buyer_nick: str = None, existing_buyer_nick: str = None) -> str:
+        sanitized_incoming = self._sanitize_order_buyer_nick(buyer_nick)
+        if sanitized_incoming:
+            return sanitized_incoming
+
+        sanitized_existing = self._sanitize_order_buyer_nick(existing_buyer_nick)
+        if sanitized_existing:
+            return sanitized_existing
+
+        return None
+
     def insert_or_update_order(self, order_id: str, item_id: str = None, buyer_id: str = None,
                               spec_name: str = None, spec_value: str = None, quantity: str = None,
                               amount: str = None, order_status: str = None, cookie_id: str = None,
@@ -6715,8 +6872,10 @@ Cookie数量: {cookie_count}
                         return False
 
                 # 检查订单是否已存在
-                cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (order_id,))
+                cursor.execute("SELECT order_id, buyer_nick FROM orders WHERE order_id = ?", (order_id,))
                 existing = cursor.fetchone()
+                existing_buyer_nick = existing[1] if existing else None
+                resolved_buyer_nick = self._resolve_order_buyer_nick_for_write(order_id, buyer_nick, existing_buyer_nick)
 
                 if existing:
                     # 更新现有订单
@@ -6733,8 +6892,11 @@ Cookie数量: {cookie_count}
                         else:
                             logger.debug(f"跳过无效buyer_id覆盖: order_id={order_id}, invalid_buyer_id={buyer_id}")
                     if buyer_nick is not None:
-                        update_fields.append("buyer_nick = ?")
-                        update_values.append(buyer_nick)
+                        if resolved_buyer_nick is not None:
+                            update_fields.append("buyer_nick = ?")
+                            update_values.append(resolved_buyer_nick)
+                        elif existing_buyer_nick and self._sanitize_order_buyer_nick(existing_buyer_nick) is None:
+                            update_fields.append("buyer_nick = NULL")
                     if sid is not None:
                         update_fields.append("sid = ?")
                         update_values.append(sid)
@@ -6798,7 +6960,7 @@ Cookie数量: {cookie_count}
                         'spec_name_2', 'spec_value_2', 'quantity', 'amount', 'order_status', 'cookie_id'
                     ]
                     insert_values = [
-                        order_id, item_id, sanitized_buyer_id, buyer_nick, sid, spec_name, spec_value,
+                        order_id, item_id, sanitized_buyer_id, resolved_buyer_nick, sid, spec_name, spec_value,
                         spec_name_2, spec_value_2, quantity, amount, normalized_order_status or 'unknown', cookie_id
                     ]
 
@@ -6893,6 +7055,37 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取订单退款前状态失败: {order_id} - {e}")
                 return None
 
+    def _lookup_buyer_nick_from_chat_messages(self, cookie_id: str, sid: str = None, buyer_id: str = None) -> str:
+        chat_id = str(sid or '').strip().split('@')[0]
+        normalized_buyer_id = str(buyer_id or '').strip()
+        if not chat_id:
+            return None
+
+        try:
+            cursor = self.conn.cursor()
+            params = [cookie_id, chat_id]
+            buyer_filter = ''
+            if normalized_buyer_id:
+                buyer_filter = ' AND sender_id = ?'
+                params.append(normalized_buyer_id)
+
+            cursor.execute(f'''
+                SELECT sender_name
+                FROM chat_messages
+                WHERE cookie_id = ? AND chat_id = ? AND direction = 2
+                  AND sender_name IS NOT NULL AND sender_name != ''{buyer_filter}
+                ORDER BY id DESC
+                LIMIT 80
+            ''', params)
+            for row in cursor.fetchall():
+                buyer_nick = self._sanitize_order_buyer_nick(row[0])
+                if buyer_nick:
+                    return buyer_nick
+        except Exception as e:
+            logger.debug(f"从聊天记录兜底买家昵称失败: cookie_id={cookie_id}, sid={sid}, buyer_id={buyer_id}, error={e}")
+
+        return None
+
     def get_orders_by_cookie(self, cookie_id: str, limit: int = 100):
         """根据Cookie ID获取订单列表"""
         with self.lock:
@@ -6908,11 +7101,14 @@ Cookie数量: {cookie_count}
 
                 orders = []
                 for row in cursor.fetchall():
+                    buyer_nick = self._sanitize_order_buyer_nick(row[3])
+                    if not buyer_nick:
+                        buyer_nick = self._lookup_buyer_nick_from_chat_messages(cookie_id, row[4], row[2])
                     orders.append({
                         'order_id': row[0],
                         'item_id': row[1],
                         'buyer_id': row[2],
-                        'buyer_nick': row[3],
+                        'buyer_nick': buyer_nick,
                         'sid': row[4],
                         'spec_name': row[5],
                         'spec_value': row[6],
@@ -6973,6 +7169,10 @@ Cookie数量: {cookie_count}
         if not buyer_id or not buyer_nick:
             return 0
 
+        sanitized_buyer_nick = self._sanitize_order_buyer_nick(buyer_nick)
+        if not sanitized_buyer_nick:
+            return 0
+
         with self.lock:
             try:
                 cursor = self.conn.cursor()
@@ -6982,18 +7182,18 @@ Cookie数量: {cookie_count}
                     cursor.execute('''
                     UPDATE orders SET buyer_nick = ?
                     WHERE buyer_id = ? AND cookie_id = ?
-                    ''', (buyer_nick, buyer_id, cookie_id))
+                    ''', (sanitized_buyer_nick, buyer_id, cookie_id))
                 else:
                     cursor.execute('''
                     UPDATE orders SET buyer_nick = ?
                     WHERE buyer_id = ?
-                    ''', (buyer_nick, buyer_id))
+                    ''', (sanitized_buyer_nick, buyer_id))
 
                 updated_count = cursor.rowcount
                 self.conn.commit()
 
                 if updated_count > 0:
-                    logger.info(f"已更新买家 {buyer_id} 的 {updated_count} 个订单昵称为: {buyer_nick}")
+                    logger.info(f"已更新买家 {buyer_id} 的 {updated_count} 个订单昵称为: {sanitized_buyer_nick}")
 
                 return updated_count
 
@@ -9023,6 +9223,250 @@ Cookie数量: {cookie_count}
                 logger.error(f"更新任务执行结果失败: {e}")
                 self.conn.rollback()
                 return False
+
+    # ==================== 聊天消息 ====================
+
+    def save_chat_message(self, cookie_id: str, chat_id: str, sender_id: str,
+                          sender_name: str, content: str, content_type: int = 1,
+                          image_url: str = None, item_id: str = None,
+                          direction: int = 2, reply_source: str = None,
+                          media_url: str = None, link_url: str = None,
+                          extra_json: str = None,
+                          created_at: str = None) -> Optional[int]:
+        """保存聊天消息"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if created_at:
+                    self._execute_sql(cursor, """
+                        INSERT INTO chat_messages (cookie_id, chat_id, sender_id, sender_name,
+                            content, content_type, image_url, item_id, direction, reply_source,
+                            media_url, link_url, extra_json, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (cookie_id, chat_id, sender_id, sender_name, content,
+                          content_type, image_url, item_id, direction, reply_source,
+                          media_url, link_url, extra_json, created_at))
+                else:
+                    self._execute_sql(cursor, """
+                        INSERT INTO chat_messages (cookie_id, chat_id, sender_id, sender_name,
+                            content, content_type, image_url, item_id, direction, reply_source,
+                            media_url, link_url, extra_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (cookie_id, chat_id, sender_id, sender_name, content,
+                          content_type, image_url, item_id, direction, reply_source,
+                          media_url, link_url, extra_json))
+                self.conn.commit()
+                return cursor.lastrowid
+            except Exception as e:
+                logger.error(f"保存聊天消息失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def get_chat_sessions(self, cookie_id: str, limit: int = 50) -> list:
+        """获取指定账号的会话列表（按最新消息排序），包含买家名称"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, """
+                    SELECT m.chat_id, m.sender_name, m.content, m.content_type,
+                           m.item_id, m.created_at, m.direction, m.sender_id,
+                           buyer.buyer_name, buyer.buyer_id
+                    FROM chat_messages m
+                    INNER JOIN (
+                        SELECT chat_id, MAX(id) AS max_id
+                        FROM chat_messages
+                        WHERE cookie_id = ?
+                        GROUP BY chat_id
+                    ) latest ON m.chat_id = latest.chat_id AND m.id = latest.max_id
+                    LEFT JOIN (
+                        SELECT chat_id, sender_name AS buyer_name, sender_id AS buyer_id
+                        FROM chat_messages
+                        WHERE cookie_id = ? AND direction = 2 AND sender_name != ''
+                        GROUP BY chat_id
+                    ) buyer ON m.chat_id = buyer.chat_id
+                    WHERE m.cookie_id = ?
+                    ORDER BY m.created_at DESC
+                    LIMIT ?
+                """, (cookie_id, cookie_id, cookie_id, limit))
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                return [dict(zip(columns, row)) for row in rows]
+            except Exception as e:
+                logger.error(f"获取会话列表失败: {e}")
+                return []
+
+    def get_chat_messages(self, cookie_id: str, chat_id: str, limit: int = 50, before_id: int = None) -> list:
+        """获取指定会话的消息列表"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if before_id:
+                    self._execute_sql(cursor, """
+                        SELECT id, cookie_id, chat_id, sender_id, sender_name, content,
+                               content_type, image_url, item_id, direction, reply_source,
+                               media_url, link_url, extra_json, created_at
+                        FROM chat_messages
+                        WHERE cookie_id = ? AND chat_id = ? AND id < ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                    """, (cookie_id, chat_id, before_id, limit))
+                else:
+                    self._execute_sql(cursor, """
+                        SELECT id, cookie_id, chat_id, sender_id, sender_name, content,
+                               content_type, image_url, item_id, direction, reply_source,
+                               media_url, link_url, extra_json, created_at
+                        FROM chat_messages
+                        WHERE cookie_id = ? AND chat_id = ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                    """, (cookie_id, chat_id, limit))
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                result = [dict(zip(columns, row)) for row in rows]
+                result.reverse()
+                return result
+            except Exception as e:
+                logger.error(f"获取聊天消息失败: {e}")
+                return []
+
+    def cleanup_old_chat_messages(self, days: int = 30) -> int:
+        """清理指定天数前的聊天消息"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, """
+                    DELETE FROM chat_messages
+                    WHERE created_at < datetime('now', ?)
+                """, (f'-{days} days',))
+                deleted = cursor.rowcount
+                self.conn.commit()
+                if deleted > 0:
+                    logger.info(f"清理了 {deleted} 条过期聊天消息（{days}天前）")
+                return deleted
+            except Exception as e:
+                logger.error(f"清理聊天消息失败: {e}")
+                self.conn.rollback()
+                return 0
+
+    def delete_chat_messages_by_session(self, cookie_id: str, chat_id: str) -> int:
+        """删除指定会话的聊天消息，用于历史补拉重建。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, """
+                    DELETE FROM chat_messages
+                    WHERE cookie_id = ? AND chat_id = ?
+                """, (cookie_id, chat_id))
+                deleted = cursor.rowcount
+                self.conn.commit()
+                logger.info(f"删除会话聊天消息成功: cookie_id={cookie_id}, chat_id={chat_id}, deleted={deleted}")
+                return deleted
+            except Exception as e:
+                logger.error(f"删除会话聊天消息失败: cookie_id={cookie_id}, chat_id={chat_id}, error={e}")
+                self.conn.rollback()
+                return 0
+
+    def get_keywords_by_item_id(self, cookie_id: str, item_id: str) -> list:
+        """获取指定商品的关键词列表"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if item_id:
+                    self._execute_sql(cursor, """
+                        SELECT k.keyword, k.reply, k.item_id, k.type, k.image_url,
+                               i.item_title
+                        FROM keywords k
+                        LEFT JOIN item_info i ON k.item_id = i.item_id AND k.cookie_id = i.cookie_id
+                        WHERE k.cookie_id = ? AND k.item_id = ?
+                        ORDER BY k.rowid
+                    """, (cookie_id, item_id))
+                else:
+                    self._execute_sql(cursor, """
+                        SELECT k.keyword, k.reply, k.item_id, k.type, k.image_url,
+                               NULL as item_title
+                        FROM keywords k
+                        WHERE k.cookie_id = ? AND (k.item_id IS NULL OR k.item_id = '')
+                        ORDER BY k.rowid
+                    """, (cookie_id,))
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                return [dict(zip(columns, row)) for row in rows]
+            except Exception as e:
+                logger.error(f"获取商品关键词失败: {e}")
+                return []
+
+    def save_keywords_for_item(self, cookie_id: str, item_id: str, keywords: list) -> bool:
+        """保存指定商品的关键词（仅影响该 item_id 的记录）"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if item_id:
+                    self._execute_sql(cursor,
+                        "DELETE FROM keywords WHERE cookie_id = ? AND item_id = ?",
+                        (cookie_id, item_id))
+                else:
+                    self._execute_sql(cursor,
+                        "DELETE FROM keywords WHERE cookie_id = ? AND (item_id IS NULL OR item_id = '')",
+                        (cookie_id,))
+
+                for kw in keywords:
+                    kw_type = kw.get('type', 'text')
+                    self._execute_sql(cursor, """
+                        INSERT INTO keywords (cookie_id, keyword, reply, item_id, type, image_url)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (cookie_id, kw['keyword'], kw.get('reply', ''),
+                          item_id or None, kw_type, kw.get('image_url')))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"保存商品关键词失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def copy_keywords_to_item(self, cookie_id: str, source_item_id: str, target_item_id: str) -> int:
+        """将源商品的关键词复制到目标商品（覆盖目标商品已有关键词）"""
+        try:
+            source_kws = self.get_keywords_by_item_id(cookie_id, source_item_id)
+            if not source_kws:
+                return 0
+            kw_list = [{
+                'keyword': kw['keyword'],
+                'reply': kw.get('reply', ''),
+                'type': kw.get('type', 'text'),
+                'image_url': kw.get('image_url'),
+            } for kw in source_kws]
+            self.save_keywords_for_item(cookie_id, target_item_id, kw_list)
+            return len(kw_list)
+        except Exception as e:
+            logger.error(f"复制关键词失败: {e}")
+            return 0
+
+    def get_all_chat_sessions(self, user_id: int, limit: int = 200) -> list:
+        """获取用户所有账号的会话列表（三栏布局用）"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, """
+                    SELECT m.cookie_id, m.chat_id, m.sender_name, m.content,
+                           m.content_type, m.item_id, m.created_at, m.direction, m.sender_id
+                    FROM chat_messages m
+                    INNER JOIN (
+                        SELECT cookie_id, chat_id, MAX(id) AS max_id
+                        FROM chat_messages
+                        WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)
+                        GROUP BY cookie_id, chat_id
+                    ) latest ON m.cookie_id = latest.cookie_id
+                               AND m.chat_id = latest.chat_id
+                               AND m.id = latest.max_id
+                    ORDER BY m.created_at DESC
+                    LIMIT ?
+                """, (user_id, limit))
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                return [dict(zip(columns, row)) for row in rows]
+            except Exception as e:
+                logger.error(f"获取全量会话列表失败: {e}")
+                return []
 
 
 # 全局单例

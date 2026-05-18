@@ -97,7 +97,6 @@
 
 ### 方式一：使用部署脚本（推荐）⭐
 
-<details>
 <summary>Linux / macOS</summary>
 
 ```bash
@@ -115,9 +114,7 @@ chmod +x docker-deploy.sh
 - `docker-compose.yml`：`http://localhost:9000`
 - `docker-compose-cn.yml`：`http://localhost:8000`
 
-</details>
 
-<details>
 <summary>Windows</summary>
 
 ```cmd
@@ -133,7 +130,6 @@ docker-deploy.bat
 - `docker-compose.yml`：`http://localhost:9000`
 - `docker-compose-cn.yml`：`http://localhost:8000`
 
-</details>
 
 ### 方式二：手动使用 Docker Compose
 
@@ -311,6 +307,11 @@ DISPLAY=:99
 - 输入账号 ID 和 Cookie 信息
 - 可按需配置用户名、密码、备注和显示浏览器
 - 保存后即可启用或刷新账号
+- `token_refresh` 命中滑块时，程序会优先复用 `browser_data/user_<账号ID>` 下的账号级浏览器画像和站点状态
+- 各账号各用各的 `browser_data/user_<账号ID>` 目录，不共享浏览器状态；同账号如果同时撞上滑块，会按现有并发保护排队，不会自己跟自己抢 profile
+- 这套账号级 persistent profile 优先策略目前只挂在 `token_refresh` 的滑块恢复链上，不会把正常消息监听、订单处理、手动导入 Cookie 主链一锅端改掉
+- `browser_data/` 属于运行期状态目录，别手贱一把清空；旧 Cookie 的自动滑块恢复很吃这里面的持久化状态
+- 如果账号级 profile 因异常退出残留了 Chromium `SingletonLock`，程序只会在确认它是“当前宿主机 + 已失效 PID”，或“Docker 容器 hostname 漂移导致的旧容器 ID 锁”时自动清理并重试；拿不准就继续走旧 fallback，不乱删锁
 
 ### 3. 使用商品擦亮
 - 在账号管理页可直接执行一键擦亮，批量处理当前账号在售商品
@@ -456,16 +457,18 @@ docker-deploy.bat
 
 ## 🧸 特别鸣谢
 
-### 开源项目参考
-- **[xianyu-auto-reply](https://github.com/zhinianboke-new/xianyu-auto-reply)** - 提供了原始项目基础与二次开发起点
+### 开源项目参考（排名不分先后）
+- **[myfish](https://github.com/Kaguya233qwq/myfish)** - 提供了扫码登录的实现思路
 - **[XianYuApis](https://github.com/cv-cat/XianYuApis)** - 提供了闲鱼 API 接口的技术参考
 - **[XianyuAutoAgent](https://github.com/shaxiu/XianyuAutoAgent)** - 提供了自动化处理的实现思路
-- **[myfish](https://github.com/Kaguya233qwq/myfish)** - 提供了扫码登录的实现思路
+- **[xianyu-auto-reply](https://github.com/zhinianboke/xianyu-auto-reply)** - 提供了基础框架与初始实现参考
 
-### 开发者支持
+### 开发者支持（贡献不分先后）
 - **[syunnrai123](https://github.com/syunnrai123)** - 为当前项目的滑块处理方案提供思路与参考
+- **[1205747671](https://github.com/1205747671)** - 为当前项目的滑块处理方案提供思路与参考
 - **[Mangor2021](https://github.com/Mangor2021)** - 为项目开发与改进提供了实际贡献
 - **[82762294](https://github.com/82762294)** - 为项目开发与改进提供了实际贡献
+- **[iidamie](https://github.com/iidamie)** - 为项目开发与改进提供了实际贡献
 
 ## ⚖️ 版权声明与使用条款
 
@@ -485,11 +488,6 @@ docker-deploy.bat
 - **标注修改内容** - 如基于本项目进行了修改，建议明确标注修改部分
 - **自行承担风险** - 使用者需自行承担部署、配置和运行风险
 - **遵守当地法规** - 使用者应确保实际用途符合当地法律法规和平台规则
-
-### 👤 项目来源
-
-- **原项目**：`zhinianboke-new/xianyu-auto-reply`
-- **当前仓库**：`GuDong2003/xianyu-auto-reply-fix`
 
 ### ⚠️ 免责声明
 

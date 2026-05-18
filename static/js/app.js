@@ -37,6 +37,9 @@ let currentItemsPage = 1; // 当前页码
 let itemsPerPage = 20; // 每页显示数量
 let totalItemsPages = 0; // 总页数
 let currentSearchKeyword = ''; // 当前搜索关键词
+let itemPublishPreviewUrls = [];
+let itemPublishInitialized = false;
+let itemPublishSubmitting = false;
 
 // 订单列表搜索和分页相关变量
 let allOrdersData = []; // 存储所有订单数据
@@ -102,6 +105,9 @@ function showSection(sectionName) {
         break;
     case 'accounts':         // 【账号管理菜单】
         loadCookies();
+        break;
+    case 'item-publish':    // 【商品发布菜单】
+        loadItemPublish();
         break;
     case 'items':           // 【商品管理菜单】
         loadItems();
@@ -170,6 +176,10 @@ function showSection(sectionName) {
         stopOrdersStream();
     }
 
+    if (sectionName !== 'online-im') {
+        stopChatStream();
+    }
+
     // 如果切换到非日志页面，停止自动刷新
     if (sectionName !== 'logs' && window.autoRefreshInterval) {
     clearInterval(window.autoRefreshInterval);
@@ -191,6 +201,11 @@ function showSection(sectionName) {
         clearTimeout(aboutRuntimeRetryTimer);
         aboutRuntimeRetryTimer = null;
     }
+}
+
+function getAuthToken() {
+    authToken = localStorage.getItem('auth_token');
+    return authToken || '';
 }
 
 // 移动端侧边栏切换
@@ -3313,9 +3328,10 @@ async function fetchJSON(url, opts = {}) {
     toggleLoading(true);
     try {
     // 添加认证头
-    if (authToken) {
+    const token = getAuthToken();
+    if (token) {
         opts.headers = opts.headers || {};
-        opts.headers['Authorization'] = `Bearer ${authToken}`;
+        opts.headers['Authorization'] = `Bearer ${token}`;
     }
 
     const res = await fetch(url, opts);
@@ -5362,7 +5378,8 @@ async function logout() {
 
 // 检查认证状态
 async function checkAuth() {
-    if (!authToken) {
+    const token = getAuthToken();
+    if (!token) {
     window.location.href = '/';
     return false;
     }
@@ -5370,7 +5387,7 @@ async function checkAuth() {
     try {
     const response = await fetch('/verify', {
         headers: {
-        'Authorization': `Bearer ${authToken}`
+        'Authorization': `Bearer ${token}`
         }
     });
     const result = await response.json();
@@ -5410,6 +5427,18 @@ async function checkAuth() {
         if (loginInfoSettings) {
         loginInfoSettings.style.display = 'flex';
         }
+
+        const riskControlSettings = document.getElementById('risk-control-settings');
+        if (riskControlSettings) {
+        riskControlSettings.style.display = 'block';
+        }
+
+        await loadRiskControlNightSettings();
+    } else {
+        const riskControlSettings = document.getElementById('risk-control-settings');
+        if (riskControlSettings) {
+        riskControlSettings.style.display = 'none';
+        }
     }
 
     return true;
@@ -5439,28 +5468,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // 启动验证会话监控
     startCaptchaSessionMonitor();
     // 添加Cookie表单提交
-    document.getElementById('addForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const id = document.getElementById('cookieId').value.trim();
-    const value = document.getElementById('cookieValue').value.trim();
-
-    if (!id || !value) return;
-
-    try {
-        await fetchJSON(apiBase + '/cookies', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id, value })
-        });
-
-        document.getElementById('cookieId').value = '';
-        document.getElementById('cookieValue').value = '';
-        showToast(`账号 "${id}" 添加成功`);
-        loadCookies();
-    } catch (err) {
-        // 错误已在fetchJSON中处理
-    }
-    });
+    document.getElementById('addForm').addEventListener('submit', handleManualCookieImport);
 
     // 添加账号密码登录表单提交
     const passwordLoginForm = document.getElementById('passwordLoginFormElement');
@@ -9041,10 +9049,12 @@ async function deleteDeliveryRule(ruleId) {
 
 // 加载用户设置
 async function loadUserSettings() {
+    const token = getAuthToken();
+    if (!token) return;
     try {
         const response = await fetch(`${apiBase}/user-settings`, {
             headers: {
-                'Authorization': `Bearer ${authToken}`
+                'Authorization': `Bearer ${token}`
             }
         });
 
@@ -9118,6 +9128,7 @@ function updatePresetSelection(selectedColor) {
 const DEFAULT_MENU_ITEMS = [
     { id: 'dashboard', name: '仪表盘', icon: 'bi-speedometer2', required: true },
     { id: 'accounts', name: '账号管理', icon: 'bi-person-circle', required: false },
+    { id: 'item-publish', name: '商品发布', icon: 'bi-bag-plus', required: false },
     { id: 'items', name: '商品管理', icon: 'bi-box-seam', required: false },
     { id: 'orders', name: '订单管理', icon: 'bi-receipt-cutoff', required: false },
     { id: 'auto-reply', name: '自动回复', icon: 'bi-chat-left-text', required: false },
@@ -9414,10 +9425,12 @@ function applyMenuVisibility() {
 
 // 加载菜单设置
 async function loadMenuSettings() {
+    const token = getAuthToken();
+    if (!token) return;
     try {
         const response = await fetch(`${apiBase}/user-settings`, {
             headers: {
-                'Authorization': `Bearer ${authToken}`
+                'Authorization': `Bearer ${token}`
             }
         });
 
@@ -9915,6 +9928,371 @@ async function doRestartSystem() {
     } catch (error) {
         console.error('重启系统失败:', error);
         showToast('重启系统失败，请检查网络连接', 'danger');
+    }
+}
+
+// ================================
+// 【商品发布菜单】相关功能
+// ================================
+
+async function loadItemPublish() {
+    ensureItemPublishPageInitialized();
+    handlePublishDeliveryChoiceChange();
+    await loadItemPublishAccounts();
+}
+
+function ensureItemPublishPageInitialized() {
+    if (itemPublishInitialized) {
+        return;
+    }
+
+    const form = document.getElementById('itemPublishForm');
+    if (form) {
+        form.addEventListener('reset', () => {
+            window.setTimeout(() => clearItemPublishForm(true), 0);
+        });
+    }
+
+    itemPublishInitialized = true;
+}
+
+async function loadItemPublishAccounts() {
+    const select = document.getElementById('publishCookieId');
+    if (!select) {
+        return;
+    }
+
+    const currentValue = select.value;
+
+    try {
+        const response = await fetch(`${apiBase}/cookies/details`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const accounts = await response.json();
+        const availableAccounts = accounts.filter(account => account.has_cookie_value !== false && account.enabled !== false);
+
+        select.innerHTML = '<option value="">请选择账号</option>';
+
+        if (availableAccounts.length === 0) {
+            const option = document.createElement('option');
+            option.value = '';
+            option.disabled = true;
+            option.textContent = '暂无可用账号';
+            select.appendChild(option);
+            return;
+        }
+
+        availableAccounts.forEach(account => {
+            const option = document.createElement('option');
+            option.value = account.id;
+            option.textContent = buildItemPublishAccountLabel(account);
+            select.appendChild(option);
+        });
+
+        if (currentValue && availableAccounts.some(account => account.id === currentValue)) {
+            select.value = currentValue;
+        } else if (availableAccounts.length === 1) {
+            select.value = availableAccounts[0].id;
+        }
+    } catch (error) {
+        console.error('加载发布账号失败:', error);
+        select.innerHTML = '<option value="">加载账号失败</option>';
+        showToast('加载发布账号失败', 'danger');
+    }
+}
+
+function buildItemPublishAccountLabel(account) {
+    const remark = String(account.remark || '').trim();
+    const username = String(account.username || '').trim();
+    if (remark) {
+        return `${account.id} · ${remark}`;
+    }
+    if (username) {
+        return `${account.id} · ${username}`;
+    }
+    return account.id;
+}
+
+function handlePublishDeliveryChoiceChange() {
+    const choice = document.getElementById('publishDeliveryChoice')?.value || '包邮';
+    const postPriceWrap = document.getElementById('publishPostPriceWrap');
+    const postPriceInput = document.getElementById('publishPostPrice');
+    const shouldShowPostPrice = choice === '一口价';
+
+    if (postPriceWrap) {
+        postPriceWrap.style.display = shouldShowPostPrice ? '' : 'none';
+    }
+    if (postPriceInput) {
+        postPriceInput.required = shouldShowPostPrice;
+        if (!shouldShowPostPrice) {
+            postPriceInput.value = '';
+        }
+    }
+}
+
+function handlePublishImagesChange() {
+    const input = document.getElementById('publishImages');
+    if (!input) {
+        return;
+    }
+
+    const files = Array.from(input.files || []);
+    if (files.length > 9) {
+        showToast('单次最多上传 9 张图片', 'warning');
+        input.value = '';
+        clearItemPublishImagePreviews();
+        return;
+    }
+
+    renderItemPublishImagePreviews(files);
+}
+
+function renderItemPublishImagePreviews(files) {
+    const previewContainer = document.getElementById('publishImagePreviewList');
+    const summary = document.getElementById('publishImageSummary');
+
+    clearItemPublishImagePreviews();
+
+    if (!previewContainer) {
+        return;
+    }
+
+    if (!files || files.length === 0) {
+        previewContainer.innerHTML = '<div class="item-publish-preview-empty">尚未选择图片</div>';
+        if (summary) {
+            summary.textContent = '请上传 1-9 张图片，建议首图清晰展示商品主体。';
+        }
+        return;
+    }
+
+    const totalSize = files.reduce((sum, file) => sum + (file.size || 0), 0);
+    previewContainer.innerHTML = files.map((file, index) => {
+        const objectUrl = URL.createObjectURL(file);
+        itemPublishPreviewUrls.push(objectUrl);
+        return `
+            <div class="item-publish-preview-card">
+                <img src="${objectUrl}" alt="预览图 ${index + 1}">
+                <div class="item-publish-preview-meta">
+                    <div class="item-publish-preview-name" title="${escapeHtml(file.name || `图片 ${index + 1}`)}">${escapeHtml(file.name || `图片 ${index + 1}`)}</div>
+                    <div class="item-publish-preview-size">${formatFileSize(file.size || 0)}</div>
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    if (summary) {
+        summary.textContent = `已选择 ${files.length} 张图片，总大小 ${formatFileSize(totalSize)}。`;
+    }
+}
+
+function clearItemPublishImagePreviews() {
+    itemPublishPreviewUrls.forEach(url => URL.revokeObjectURL(url));
+    itemPublishPreviewUrls = [];
+
+    const previewContainer = document.getElementById('publishImagePreviewList');
+    const summary = document.getElementById('publishImageSummary');
+    if (previewContainer) {
+        previewContainer.innerHTML = '<div class="item-publish-preview-empty">尚未选择图片</div>';
+    }
+    if (summary) {
+        summary.textContent = '请上传 1-9 张图片，建议首图清晰展示商品主体。';
+    }
+}
+
+function clearItemPublishForm(clearResult = true) {
+    clearItemPublishImagePreviews();
+    handlePublishDeliveryChoiceChange();
+
+    const imagesInput = document.getElementById('publishImages');
+    if (imagesInput) {
+        imagesInput.value = '';
+    }
+
+    if (clearResult) {
+        hideItemPublishResult();
+    }
+}
+
+function hideItemPublishResult() {
+    const panel = document.getElementById('publishResultPanel');
+    const meta = document.getElementById('publishResultMeta');
+    if (panel) {
+        panel.style.display = 'none';
+    }
+    if (meta) {
+        meta.innerHTML = '';
+    }
+}
+
+function renderItemPublishResult(data, isSuccess) {
+    const panel = document.getElementById('publishResultPanel');
+    const badge = document.getElementById('publishResultBadge');
+    const title = document.getElementById('publishResultTitle');
+    const message = document.getElementById('publishResultMessage');
+    const meta = document.getElementById('publishResultMeta');
+
+    if (!panel || !badge || !title || !message || !meta) {
+        return;
+    }
+
+    panel.style.display = '';
+    badge.className = `badge ${isSuccess ? 'text-bg-success' : 'text-bg-danger'}`;
+    badge.textContent = isSuccess ? '成功' : '失败';
+    title.textContent = isSuccess ? '商品发布完成' : '商品发布失败';
+    message.textContent = data.message || (isSuccess ? '商品发布成功' : '商品发布失败');
+
+    const metaRows = [];
+    if (data.published_item_id) {
+        metaRows.push({ label: '商品ID', value: data.published_item_id });
+    }
+
+    const syncResult = data.sync_result || {};
+    if (syncResult.message) {
+        metaRows.push({ label: '同步结果', value: syncResult.message });
+    }
+
+    const pageSync = syncResult.page_sync || {};
+    if (pageSync.current_count || pageSync.saved_count) {
+        metaRows.push({
+            label: '最近页同步',
+            value: `获取 ${pageSync.current_count || 0} 个商品，写入 ${pageSync.saved_count || 0} 个`
+        });
+    }
+
+    const fullSync = syncResult.full_sync || {};
+    if (fullSync.used) {
+        metaRows.push({
+            label: '补充同步',
+            value: fullSync.success
+                ? `全量扫描 ${fullSync.total_count || 0} 个商品，写入 ${fullSync.total_saved || 0} 个`
+                : (fullSync.error || '补充同步失败')
+        });
+    }
+
+    if (!isSuccess && data.detail) {
+        metaRows.push({ label: '错误详情', value: data.detail });
+    }
+
+    if (metaRows.length === 0) {
+        meta.innerHTML = '<div class="text-muted small">当前没有更多结果详情。</div>';
+        return;
+    }
+
+    meta.innerHTML = metaRows.map(row => `
+        <div class="item-publish-result-row">
+            <span class="item-publish-result-label">${escapeHtml(row.label)}</span>
+            <span class="item-publish-result-value">${escapeHtml(String(row.value || ''))}</span>
+        </div>
+    `).join('');
+}
+
+async function submitItemPublishForm() {
+    if (itemPublishSubmitting) {
+        return;
+    }
+
+    const cookieId = document.getElementById('publishCookieId')?.value || '';
+    const title = document.getElementById('publishTitle')?.value.trim() || '';
+    const description = document.getElementById('publishDescription')?.value.trim() || '';
+    const currentPrice = document.getElementById('publishCurrentPrice')?.value.trim() || '';
+    const originalPrice = document.getElementById('publishOriginalPrice')?.value.trim() || '';
+    const deliveryChoice = document.getElementById('publishDeliveryChoice')?.value || '包邮';
+    const postPrice = document.getElementById('publishPostPrice')?.value.trim() || '';
+    const canSelfPickup = document.getElementById('publishCanSelfPickup')?.checked || false;
+    const imageInput = document.getElementById('publishImages');
+    const files = Array.from(imageInput?.files || []);
+    const submitButton = document.getElementById('itemPublishSubmitBtn');
+
+    if (!cookieId) {
+        showToast('请选择发布账号', 'warning');
+        return;
+    }
+    if (!title) {
+        showToast('请输入商品标题', 'warning');
+        return;
+    }
+    if (!description) {
+        showToast('请输入商品描述', 'warning');
+        return;
+    }
+    if (files.length === 0) {
+        showToast('请至少上传 1 张商品图片', 'warning');
+        return;
+    }
+    if (files.length > 9) {
+        showToast('单次最多上传 9 张图片', 'warning');
+        return;
+    }
+    if (originalPrice && !currentPrice) {
+        showToast('填写原价时必须同时填写现价', 'warning');
+        return;
+    }
+    if (deliveryChoice === '一口价' && !postPrice) {
+        showToast('运费方式为一口价时必须填写邮费', 'warning');
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('cookie_id', cookieId);
+    formData.append('title', title);
+    formData.append('description', description);
+    formData.append('current_price', currentPrice);
+    formData.append('original_price', originalPrice);
+    formData.append('delivery_choice', deliveryChoice);
+    formData.append('post_price', postPrice);
+    formData.append('can_self_pickup', canSelfPickup ? 'true' : 'false');
+    files.forEach(file => formData.append('images', file));
+
+    itemPublishSubmitting = true;
+    if (submitButton) {
+        submitButton.disabled = true;
+        submitButton.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>发布中...';
+    }
+
+    try {
+        const response = await fetch(`${apiBase}/item-publish`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: formData
+        });
+
+        const responseText = await response.text();
+        let responseData = {};
+        try {
+            responseData = responseText ? JSON.parse(responseText) : {};
+        } catch (parseError) {
+            responseData = { detail: responseText || `HTTP ${response.status}` };
+        }
+
+        if (!response.ok) {
+            const errorMessage = responseData.detail || responseData.message || `HTTP ${response.status}`;
+            renderItemPublishResult({ message: errorMessage, detail: errorMessage }, false);
+            showToast(errorMessage, 'danger');
+            return;
+        }
+
+        renderItemPublishResult(responseData, true);
+        showToast(responseData.message || '商品发布成功', 'success');
+    } catch (error) {
+        console.error('发布商品失败:', error);
+        const errorMessage = error.message || '发布商品失败';
+        renderItemPublishResult({ message: errorMessage, detail: errorMessage }, false);
+        showToast(errorMessage, 'danger');
+    } finally {
+        itemPublishSubmitting = false;
+        if (submitButton) {
+            submitButton.disabled = false;
+            submitButton.innerHTML = '<i class="bi bi-cloud-upload me-1"></i>发布商品';
+        }
     }
 }
 
@@ -11707,6 +12085,206 @@ function toggleManualInput() {
         document.getElementById('addForm').reset();
     } else {
         manualForm.style.display = 'none';
+        resetManualCookieImportForm();
+    }
+}
+
+let manualCookieImportCheckInterval = null;
+let manualCookieImportSessionId = null;
+let manualCookieImportPollingState = {
+    sessionId: null,
+    inFlight: false,
+    completed: false
+};
+
+async function handleManualCookieImport(event) {
+    event.preventDefault();
+
+    const accountId = document.getElementById('cookieId').value.trim();
+    const cookieValue = document.getElementById('cookieValue').value.trim();
+    const showBrowserCheckbox = document.getElementById('manualCookieShowBrowser');
+    const showBrowser = showBrowserCheckbox ? showBrowserCheckbox.checked : false;
+
+    if (!accountId || !cookieValue) {
+        showToast('请填写完整的账号ID和Cookie', 'warning');
+        return;
+    }
+
+    const submitBtn = event.target.querySelector('button[type="submit"]');
+    const originalText = submitBtn.innerHTML;
+    submitBtn.disabled = true;
+    submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>验证中...';
+
+    try {
+        const response = await fetch(`${apiBase}/manual-cookie-import`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                account_id: accountId,
+                cookie: cookieValue,
+                show_browser: showBrowser
+            })
+        });
+
+        const data = await response.json();
+        if (response.ok && data.success && data.session_id) {
+            manualCookieImportSessionId = data.session_id;
+            startManualCookieImportCheck(originalText);
+        } else {
+            showToast(data.message || 'Cookie 导入验证失败', 'danger');
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = originalText;
+        }
+    } catch (error) {
+        console.error('手动导入 Cookie 失败:', error);
+        showToast('网络错误，请重试', 'danger');
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = originalText;
+    }
+}
+
+function clearManualCookieImportCheck() {
+    if (manualCookieImportCheckInterval) {
+        clearInterval(manualCookieImportCheckInterval);
+        manualCookieImportCheckInterval = null;
+    }
+}
+
+function resetManualCookieImportForm() {
+    manualCookieImportSessionId = null;
+    clearManualCookieImportCheck();
+    manualCookieImportPollingState = {
+        sessionId: null,
+        inFlight: false,
+        completed: false
+    };
+
+    const submitBtn = document.querySelector('#addForm button[type="submit"]');
+    if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = '<i class="bi bi-plus-lg me-1"></i>导入并验证账号';
+    }
+}
+
+function handleManualCookieImportSuccess(data) {
+    closePasswordLoginQRModal();
+    showToast(`账号 ${data.account_id} 导入并验证成功`, 'success');
+
+    const form = document.getElementById('addForm');
+    if (form) {
+        form.reset();
+    }
+    const manualForm = document.getElementById('manualInputForm');
+    if (manualForm) {
+        manualForm.style.display = 'none';
+    }
+    loadCookies();
+    resetManualCookieImportForm();
+}
+
+function handleManualCookieImportFailure(data) {
+    closePasswordLoginQRModal();
+    showToast(data.message || data.error || 'Cookie 导入验证失败', 'danger');
+    resetManualCookieImportForm();
+}
+
+function startManualCookieImportCheck(originalText) {
+    clearManualCookieImportCheck();
+
+    const submitBtn = document.querySelector('#addForm button[type="submit"]');
+    if (submitBtn) {
+        submitBtn.dataset.originalText = originalText;
+    }
+
+    manualCookieImportPollingState = {
+        sessionId: manualCookieImportSessionId,
+        inFlight: false,
+        completed: false
+    };
+
+    manualCookieImportCheckInterval = setInterval(checkManualCookieImportStatus, 2000);
+    checkManualCookieImportStatus();
+}
+
+async function checkManualCookieImportStatus() {
+    if (!manualCookieImportSessionId || manualCookieImportPollingState.completed || manualCookieImportPollingState.inFlight) {
+        return;
+    }
+
+    const sessionId = manualCookieImportSessionId;
+    manualCookieImportPollingState.inFlight = true;
+
+    try {
+        const response = await fetch(`${apiBase}/manual-cookie-import/check/${sessionId}`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            if (manualCookieImportPollingState.sessionId !== sessionId || manualCookieImportPollingState.completed) {
+                return;
+            }
+
+            switch (data.status) {
+                case 'processing':
+                    break;
+                case 'verification_required':
+                    showPasswordLoginQRCode(
+                        data.screenshot_path || data.verification_url,
+                        data.screenshot_path,
+                        data.verification_type
+                    );
+                    break;
+                case 'success':
+                    manualCookieImportPollingState.completed = true;
+                    clearManualCookieImportCheck();
+                    handleManualCookieImportSuccess(data);
+                    break;
+                case 'failed':
+                    manualCookieImportPollingState.completed = true;
+                    clearManualCookieImportCheck();
+                    handleManualCookieImportFailure(data);
+                    break;
+                case 'not_found':
+                case 'forbidden':
+                case 'error':
+                    manualCookieImportPollingState.completed = true;
+                    clearManualCookieImportCheck();
+                    closePasswordLoginQRModal();
+                    showToast(data.message || 'Cookie 导入验证检查失败', 'danger');
+                    resetManualCookieImportForm();
+                    break;
+            }
+        } else {
+            let errorMessage = 'Cookie 导入验证检查失败';
+            try {
+                const errorData = await response.json();
+                errorMessage = errorData.message || errorData.detail || errorMessage;
+            } catch (e) {
+                // ignore parse error
+            }
+            manualCookieImportPollingState.completed = true;
+            clearManualCookieImportCheck();
+            closePasswordLoginQRModal();
+            showToast(errorMessage, 'danger');
+            resetManualCookieImportForm();
+        }
+    } catch (error) {
+        console.error('检查手动导入 Cookie 状态失败:', error);
+        manualCookieImportPollingState.completed = true;
+        clearManualCookieImportCheck();
+        closePasswordLoginQRModal();
+        showToast('网络错误，请重试', 'danger');
+        resetManualCookieImportForm();
+    } finally {
+        if (manualCookieImportPollingState.sessionId === sessionId) {
+            manualCookieImportPollingState.inFlight = false;
+        }
     }
 }
 
@@ -11719,6 +12297,7 @@ function togglePasswordLogin() {
         // 隐藏手动输入表单
         if (manualForm) {
             manualForm.style.display = 'none';
+            resetManualCookieImportForm();
         }
         // 隐藏刷新Cookie表单
         if (refreshForm) {
@@ -11742,6 +12321,7 @@ function toggleRefreshCookieForm() {
         // 隐藏其他表单
         if (manualForm) {
             manualForm.style.display = 'none';
+            resetManualCookieImportForm();
         }
         if (passwordForm) {
             passwordForm.style.display = 'none';
@@ -11979,13 +12559,18 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                     loadCookies();
                     break;
                 case 'failed':
+                case 'cancelled':
                 case 'error':
                 case 'not_found':
                 case 'forbidden':
                     stopRefreshCookiePolling(sessionId);
                     closePasswordLoginQRModal();
                     toggleLoading(false);
-                    showToast(`刷新失败: ${data.message || data.error || '未知错误'}`, 'danger');
+                    if (data.status === 'cancelled') {
+                        showToast(data.message || '刷新Cookie已取消', 'info');
+                    } else {
+                        showToast(`刷新失败: ${data.message || data.error || '未知错误'}`, 'danger');
+                    }
                     break;
             }
         } catch (error) {
@@ -12009,6 +12594,11 @@ let passwordLoginPollingState = {
     sessionId: null,
     inFlight: false,
     completed: false
+};
+let passwordLoginQRModalEventsBound = false;
+let passwordLoginQRModalState = {
+    systemClosing: false,
+    cancelInFlight: false
 };
 
 // 处理账号密码登录表单提交
@@ -12127,6 +12717,13 @@ async function checkPasswordLoginStatus() {
                     clearPasswordLoginCheck();
                     handlePasswordLoginFailure(data);
                     break;
+                case 'cancelled':
+                    passwordLoginPollingState.completed = true;
+                    clearPasswordLoginCheck();
+                    closePasswordLoginQRModal();
+                    showToast(data.message || '登录已取消', 'info');
+                    resetPasswordLoginForm();
+                    break;
                 case 'not_found':
                 case 'forbidden':
                 case 'error':
@@ -12180,6 +12777,74 @@ function getPasswordLoginVerificationTypeLabel(verificationType) {
     return labelMap[normalized] || normalized || '身份验证';
 }
 
+async function cancelPasswordLoginSession(sessionId, flowLabel = '登录') {
+    if (!sessionId || passwordLoginQRModalState.cancelInFlight) {
+        return;
+    }
+
+    passwordLoginQRModalState.cancelInFlight = true;
+    try {
+        const response = await fetch(`${apiBase}/password-login/cancel/${sessionId}`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.success === false) {
+            console.warn(`${flowLabel}取消请求返回异常:`, data);
+            showToast(data.message || `已停止当前${flowLabel}轮询`, 'warning');
+            return;
+        }
+        showToast(data.message || `${flowLabel}已取消`, 'info');
+    } catch (error) {
+        console.error(`取消${flowLabel}会话失败:`, error);
+        showToast(`已停止当前${flowLabel}轮询，请稍后重试`, 'warning');
+    } finally {
+        passwordLoginQRModalState.cancelInFlight = false;
+    }
+}
+
+function bindPasswordLoginQRModalEvents(modalElement) {
+    if (!modalElement || passwordLoginQRModalEventsBound) {
+        return;
+    }
+
+    modalElement.addEventListener('hidden.bs.modal', function () {
+        if (passwordLoginQRModalState.systemClosing) {
+            passwordLoginQRModalState.systemClosing = false;
+            return;
+        }
+
+        if (passwordLoginPollingState.sessionId && !passwordLoginPollingState.completed) {
+            const activeSessionId = passwordLoginPollingState.sessionId;
+            passwordLoginPollingState.completed = true;
+            passwordLoginPollingState.inFlight = false;
+            resetPasswordLoginForm();
+            void cancelPasswordLoginSession(activeSessionId, '登录');
+            return;
+        }
+
+        if (refreshCookiePollingState.sessionId && !refreshCookiePollingState.completed) {
+            const activeSessionId = refreshCookiePollingState.sessionId;
+            stopRefreshCookiePolling(activeSessionId);
+            refreshCookiePollingState.inFlight = false;
+            toggleLoading(false);
+            void cancelPasswordLoginSession(activeSessionId, '刷新Cookie');
+            return;
+        }
+
+        if (manualCookieImportPollingState.sessionId && !manualCookieImportPollingState.completed) {
+            manualCookieImportPollingState.completed = true;
+            manualCookieImportPollingState.inFlight = false;
+            resetManualCookieImportForm();
+            showToast('已停止当前导入验证流程', 'info');
+        }
+    });
+
+    passwordLoginQRModalEventsBound = true;
+}
+
 // 显示账号密码登录验证
 function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationType) {
     // 使用现有的二维码登录模态框
@@ -12189,6 +12854,7 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
         createPasswordLoginQRModal();
         modal = document.getElementById('passwordLoginQRModal');
     }
+    bindPasswordLoginQRModalEvents(modal);
     
     // 更新模态框标题
     const modalTitle = document.getElementById('passwordLoginQRModalLabel');
@@ -12267,6 +12933,7 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath, verificationTy
 function closePasswordLoginQRModal() {
     const modalElement = document.getElementById('passwordLoginQRModal');
     if (!modalElement) {
+        passwordLoginQRModalState.systemClosing = false;
         return;
     }
 
@@ -12293,8 +12960,11 @@ function closePasswordLoginQRModal() {
     }
 
     const modalInstance = bootstrap.Modal.getInstance(modalElement);
-    if (modalInstance) {
+    if (modalInstance && modalElement.classList.contains('show')) {
+        passwordLoginQRModalState.systemClosing = true;
         modalInstance.hide();
+    } else {
+        passwordLoginQRModalState.systemClosing = false;
     }
 }
 
@@ -12348,6 +13018,7 @@ function createPasswordLoginQRModal() {
     `;
     
     document.body.insertAdjacentHTML('beforeend', modalHtml);
+    bindPasswordLoginQRModalEvents(document.getElementById('passwordLoginQRModal'));
 }
 
 // 处理账号密码登录成功
@@ -12414,6 +13085,7 @@ function resetPasswordLoginForm() {
 let qrCodeCheckInterval = null;
 let qrCodeSessionId = null;
 let qrCodeModalEventsBound = false;
+let qrLoginMode = 'standard'; // 'standard' = 原 Playwright；'lite' = 纯 HTTP (cv-cat 风格)
 let qrCodeVerificationState = {
     renderKey: '',
     toastShown: false,
@@ -12421,6 +13093,26 @@ let qrCodeVerificationState = {
     completed: false,
     activeSessionId: null
 };
+
+function getQRLoginEndpoints() {
+    if (qrLoginMode === 'lite') {
+        return {
+            generate: `${apiBase}/qr-login-lite/generate`,
+            checkPrefix: `${apiBase}/qr-login-lite/check/`,
+        };
+    }
+    return {
+        generate: `${apiBase}/qr-login/generate`,
+        checkPrefix: `${apiBase}/qr-login/check/`,
+    };
+}
+
+function applyQRLoginModeChrome() {
+    const titleEl = document.getElementById('qrLoginModalTitleText');
+    if (titleEl) {
+        titleEl.textContent = qrLoginMode === 'lite' ? '轻量扫码登录闲鱼账号' : '扫码登录闲鱼账号';
+    }
+}
 
 function normalizeStaticAssetPath(path) {
     if (!path) {
@@ -12473,7 +13165,9 @@ function initializeQRCodeLoginModal() {
 }
 
 // 显示扫码登录模态框
-function showQRCodeLogin() {
+function showQRCodeLogin(mode = 'standard') {
+    qrLoginMode = mode === 'lite' ? 'lite' : 'standard';
+    applyQRLoginModeChrome();
     const modalElement = initializeQRCodeLoginModal();
     if (!modalElement) {
         showToast('扫码登录弹窗未找到，请刷新页面重试', 'danger');
@@ -12495,7 +13189,8 @@ async function generateQRCode() {
     resetQRCodeVerificationState();
     showQRCodeLoading();
 
-    const response = await fetch(`${apiBase}/qr-login/generate`, {
+    const endpoints = getQRLoginEndpoints();
+    const response = await fetch(endpoints.generate, {
         method: 'POST',
         headers: {
         'Authorization': `Bearer ${authToken}`,
@@ -12579,7 +13274,8 @@ async function checkQRCodeStatus() {
     qrCodeVerificationState.inFlight = true;
 
     try {
-    const response = await fetch(`${apiBase}/qr-login/check/${requestSessionId}`, {
+    const endpoints = getQRLoginEndpoints();
+    const response = await fetch(`${endpoints.checkPrefix}${requestSessionId}`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
@@ -13543,6 +14239,7 @@ async function loadSystemSettings() {
             // 显示/隐藏管理员专用设置（仅管理员可见）
             const apiSecuritySettings = document.getElementById('api-security-settings');
             const loginInfoSettings = document.getElementById('login-info-settings');
+            const riskControlSettings = document.getElementById('risk-control-settings');
             const outgoingConfigs = document.getElementById('outgoing-configs');
             const backupManagement = document.getElementById('backup-management');
             const systemRestartBtn = document.getElementById('system-restart-btn');
@@ -13553,6 +14250,9 @@ async function loadSystemSettings() {
             }
             if (loginInfoSettings) {
                 loginInfoSettings.style.display = isAdmin ? 'flex' : 'none';
+            }
+            if (riskControlSettings) {
+                riskControlSettings.style.display = isAdmin ? 'block' : 'none';
             }
             if (outgoingConfigs) {
                 outgoingConfigs.style.display = isAdmin ? 'block' : 'none';
@@ -13573,6 +14273,7 @@ async function loadSystemSettings() {
                 await loadAPISecuritySettings();
                 await loadRegistrationSettings();
                 await loadLoginInfoSettings();
+                await loadRiskControlNightSettings();
                 await loadOutgoingConfigs();
             }
         }
@@ -13580,9 +14281,13 @@ async function loadSystemSettings() {
         console.error('获取用户信息失败:', error);
         // 出错时隐藏管理员功能
         const loginInfoSettings = document.getElementById('login-info-settings');
+        const riskControlSettings = document.getElementById('risk-control-settings');
         const dashboardHotUpdateGroup = document.getElementById('dashboardHotUpdateGroup');
         if (loginInfoSettings) {
             loginInfoSettings.style.display = 'none';
+        }
+        if (riskControlSettings) {
+            riskControlSettings.style.display = 'none';
         }
         if (dashboardHotUpdateGroup) {
             dashboardHotUpdateGroup.style.display = 'none';
@@ -13612,6 +14317,104 @@ async function loadAPISecuritySettings() {
     } catch (error) {
         console.error('加载API安全设置失败:', error);
         showToast('加载API安全设置失败', 'danger');
+    }
+}
+
+async function loadRiskControlNightSettings() {
+    try {
+        const response = await fetch('/system-settings', {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error('加载夜间风控降频设置失败');
+        }
+
+        const settings = await response.json();
+        const enabledInput = document.getElementById('riskControlNightModeEnabled');
+        const startHourInput = document.getElementById('riskControlNightStartHour');
+        const endHourInput = document.getElementById('riskControlNightEndHour');
+
+        if (enabledInput) {
+            enabledInput.checked = settings.risk_control_night_mode_enabled === 'true';
+        }
+        if (startHourInput) {
+            startHourInput.value = settings.risk_control_night_start_hour || '1';
+        }
+        if (endHourInput) {
+            endHourInput.value = settings.risk_control_night_end_hour || '6';
+        }
+    } catch (error) {
+        console.error('加载夜间风控降频设置失败:', error);
+        showToast('加载夜间风控降频设置失败', 'danger');
+    }
+}
+
+async function saveRiskControlNightSettings() {
+    const enabledInput = document.getElementById('riskControlNightModeEnabled');
+    const startHourInput = document.getElementById('riskControlNightStartHour');
+    const endHourInput = document.getElementById('riskControlNightEndHour');
+    const statusBox = document.getElementById('riskControlNightSettingsStatus');
+
+    if (!enabledInput || !startHourInput || !endHourInput) {
+        return;
+    }
+
+    const startHour = Number.parseInt(startHourInput.value, 10);
+    const endHour = Number.parseInt(endHourInput.value, 10);
+    if (Number.isNaN(startHour) || startHour < 0 || startHour > 23 || Number.isNaN(endHour) || endHour < 0 || endHour > 23) {
+        showToast('夜间时间必须填写 0-23 的整数小时', 'warning');
+        return;
+    }
+
+    const payloads = [
+        {
+            key: 'risk_control_night_mode_enabled',
+            value: enabledInput.checked ? 'true' : 'false',
+            description: '是否启用夜间风控降频',
+        },
+        {
+            key: 'risk_control_night_start_hour',
+            value: String(startHour),
+            description: '夜间风控降频开始小时',
+        },
+        {
+            key: 'risk_control_night_end_hour',
+            value: String(endHour),
+            description: '夜间风控降频结束小时',
+        }
+    ];
+
+    try {
+        for (const item of payloads) {
+            const response = await fetch(`/system-settings/${item.key}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${authToken}`
+                },
+                body: JSON.stringify({
+                    value: item.value,
+                    description: item.description,
+                })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `保存 ${item.key} 失败`);
+            }
+        }
+
+        if (statusBox) {
+            statusBox.textContent = `夜间风控降频设置已保存：${enabledInput.checked ? '开启' : '关闭'}，区间 ${String(startHour).padStart(2, '0')}:00 - ${String(endHour).padStart(2, '0')}:00`;
+            statusBox.classList.remove('d-none');
+        }
+        showToast('夜间风控降频设置已保存', 'success');
+    } catch (error) {
+        console.error('保存夜间风控降频设置失败:', error);
+        showToast(`保存夜间风控降频设置失败: ${error.message || '未知错误'}`, 'danger');
     }
 }
 
@@ -17753,7 +18556,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.9.3';
+const DEFAULT_VERSION = 'v2.0.0';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -17864,9 +18667,27 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.9.3',
+    version: 'v2.0.0',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v2.0.0',
+            date: '2026-05-19',
+            updates: [
+                '【重要】本次为大版本升级，包含登录、扫码、滑块验证、Token 刷新、在线客服、商品发布、历史订单同步和数据库结构等重要调整',
+                '【新功能】新增商品发布能力，补齐商品发布相关接口、页面与发布工具模块，完善商品运营流程',
+                '【新功能】新增在线客服三栏界面，支持会话列表、消息流、账号上下文与实时消息展示，客服处理更集中',
+                '【新功能】新增聊天会话持久化与历史补拉能力，补强聊天消息入库、会话恢复与历史消息读取，减少重启后的上下文丢失',
+                '【优化】重构扫码登录、账密登录、滑块验证、Session/Profile 复用和 Token 刷新流程，提升复杂风控场景下的恢复稳定性',
+                '【优化】新增夜间风控降频与连续失败保护策略，减少异常账号持续触发风控',
+                '【修复】修复自动回复并发去重问题，减少重复消息、重复任务或多实例竞争导致的重复回复',
+                '【修复】修复订单买家昵称污染，拦截“工作台通知”“等待你发货”“买家”等系统文案写入订单买家昵称，并在订单列表展示时回退真实聊天昵称',
+                '【修复】修复自动发货通知买家名错误，发货失败通知优先从订单与聊天记录解析真实买家昵称，避免显示系统标题或固定“买家”',
+                '【优化】优化历史订单同步容错，单个账号 Cookie 失效、权限不足或接口异常时跳过该账号并继续同步其他账号，同时返回明确处理建议',
+                '【修复】修复停止脚本噪音，停止服务时优先清理项目相关 Node 子进程，减少 shutdown 阶段反复输出 Error: write EPIPE',
+                '【优化】补强热更新检测、忽略版本、版本读取和清单生成能力'
+            ]
+        },
         {
             version: 'v1.9.3',
             date: '2026-04-15',
@@ -19828,259 +20649,847 @@ document.head.appendChild(hotUpdateStyle);
 
 // ==================== 在线客服IM功能 ====================
 
-// 存储IM账号数据
-let imAccountsData = [];
+let chatCurrentCookieId = '';
+let chatCurrentChatId = '';
+let chatCurrentToUserId = '';
+let chatCurrentSenderName = '';
+let chatCurrentItemId = '';
+let chatSessionsCache = [];
+let chatOldestMsgId = null;
+let chatSseAbortController = null;
+let chatSseRetryCount = 0;
+let chatSseShouldRun = false;
 
-/**
- * 加载IM账号列表
- */
-async function loadImAccountList() {
+function buildSafeCheckboxId(prefix, rawValue) {
+    const normalized = String(rawValue || '')
+        .trim()
+        .replace(/[^a-zA-Z0-9_-]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+    return `${prefix}_${normalized || 'item'}`;
+}
+
+function normalizeChatSessionPreview(content, contentType) {
+    if (Number(contentType) === 2) return '[图片]';
+    const text = String(content || '').trim();
+    if (!text) return '[暂无文本内容]';
+    const hiddenMarkers = new Set(['[系统消息]', '[空消息]', '点击补拉该会话历史消息']);
+    if (hiddenMarkers.has(text)) return '[系统/占位消息]';
+    return text;
+}
+
+function resolveSessionDisplayName(session) {
+    return session?.fish_nick
+        || session?.buyer_name_resolved
+        || session?.buyer_name
+        || (session?.direction === 2 ? (session?.sender_name || session?.sender_id || session?.chat_id) : (session?.sender_name || session?.chat_id))
+        || session?.chat_id
+        || '-';
+}
+
+function resolveSessionAvatar(session) {
+    if (session?.avatar) {
+        return { type: 'image', value: session.avatar };
+    }
+    const displayName = resolveSessionDisplayName(session);
+    return { type: 'text', value: (displayName || '?').charAt(0).toUpperCase() };
+}
+
+function resolveSessionPreview(session) {
+    return session?.item_title
+        || session?.order_status_name
+        || normalizeChatSessionPreview(session?.content, session?.content_type);
+}
+
+function getChatSessionState(session) {
+    return {
+        tag: '',
+        preview: resolveSessionPreview(session),
+        submeta: session?.order_status_name || session?.item_tips || '',
+        className: ''
+    };
+}
+
+function updateChatHeaderMeta(session) {
+    const headerItemId = document.getElementById('chatHeaderItemId');
+    const headerMeta = document.getElementById('chatHeaderMeta');
+    if (headerItemId) {
+        headerItemId.textContent = session?.item_id ? `商品: ${session.item_id}` : '';
+    }
+    if (!headerMeta) return;
+    const parts = [];
+    if (session?.item_title) parts.push(session.item_title);
+    if (session?.item_price) parts.push(`￥${session.item_price}`);
+    if (session?.order_status_name) parts.push(session.order_status_name);
+    if (session?.item_tips) parts.push(session.item_tips);
+    headerMeta.textContent = parts.join(' · ');
+}
+
+function scoreChatSession(session) {
+    const preview = normalizeChatSessionPreview(session?.content, session?.content_type);
+    let score = 0;
+    if (preview !== '[系统/占位消息]' && preview !== '[暂无文本内容]') score += 20;
+    if (String(session?.buyer_name || '').trim()) score += 8;
+    if (String(session?.item_id || '').trim()) score += 4;
+    if (String(session?.created_at || '').trim()) score += 2;
+    return score;
+}
+
+function sortChatSessions(sessions) {
+    return [...(sessions || [])].sort((a, b) => {
+        const scoreDiff = scoreChatSession(b) - scoreChatSession(a);
+        if (scoreDiff !== 0) return scoreDiff;
+        return String(b?.created_at || '').localeCompare(String(a?.created_at || ''));
+    });
+}
+
+function mergeChatSessionLists(primarySessions, secondarySessions) {
+    const merged = [];
+    const seen = new Set();
+    [...(primarySessions || []), ...(secondarySessions || [])].forEach(session => {
+        const chatId = String(session?.chat_id || '').trim();
+        if (!chatId || seen.has(chatId)) return;
+        seen.add(chatId);
+        merged.push(session);
+    });
+    return sortChatSessions(merged);
+}
+
+async function refreshChatAccounts() {
+    const body = document.getElementById('chatAccountsBody');
+    if (!body) return;
+    body.innerHTML = '<div class="text-center text-muted py-4 small"><div class="spinner-border spinner-border-sm"></div></div>';
     try {
-        // 重置账号密码显示为默认值
-        const usernameEl = document.getElementById('imDisplayUsername');
-        const passwordEl = document.getElementById('imDisplayPassword');
-        if (usernameEl) usernameEl.textContent = '-';
-        if (passwordEl) passwordEl.textContent = '-';
-
-        const response = await fetch(`${apiBase}/cookies/details`, {
-            headers: {
-                'Authorization': `Bearer ${authToken}`
-            }
-        });
-
-        if (response.ok) {
-            const data = await response.json();
-            imAccountsData = data || [];
-
-            const select = document.getElementById('imAccountSelect');
-            if (select) {
-                select.innerHTML = '<option value="">-- 选择账号 --</option>';
-
-                imAccountsData.forEach(account => {
-                    const option = document.createElement('option');
-                    option.value = account.id;
-                    option.textContent = account.id;
-                    // 仅缓存非敏感账号信息，敏感字段按需拉取
-                    option.dataset.username = account.username || '';
-                    select.appendChild(option);
-                });
-            }
-        } else {
-            console.error('加载IM账号列表失败:', response.status);
+        const result = await fetchJSON(`${apiBase}/api/chat/accounts`);
+        if (!result.success) {
+            body.innerHTML = '<div class="text-center text-muted py-4 small">加载失败</div>';
+            return;
         }
+        const accounts = result.accounts || [];
+        if (!accounts.length) {
+            body.innerHTML = '<div class="text-center text-muted py-4 small">暂无可用账号</div>';
+            return;
+        }
+        body.innerHTML = '';
+        accounts.forEach(account => {
+            const div = document.createElement('div');
+            div.className = 'chat-account-item' + (account.id === chatCurrentCookieId ? ' active' : '');
+            div.innerHTML = `<div class="chat-account-dot ${account.connected ? 'online' : 'offline'}"></div><div class="chat-account-name" title="${escapeHtml(account.id)}">${escapeHtml(account.name || account.id)}</div>`;
+            div.onclick = () => selectChatAccount(account.id);
+            body.appendChild(div);
+        });
     } catch (error) {
-        console.error('加载IM账号列表失败:', error);
+        console.error('加载账号列表失败:', error);
+        body.innerHTML = '<div class="text-center text-muted py-4 small">加载失败</div>';
     }
 }
 
-/**
- * 账号选择变化时的处理
- */
-async function fetchImAccountDetails(accountId) {
-    const response = await fetch(`${apiBase}/cookie/${encodeURIComponent(accountId)}/details?include_secrets=true`, {
-        headers: {
-            'Authorization': `Bearer ${authToken}`
+async function selectChatAccount(cookieId) {
+    chatCurrentCookieId = cookieId;
+    chatCurrentChatId = '';
+    chatCurrentToUserId = '';
+    chatCurrentSenderName = '';
+    chatCurrentItemId = '';
+    chatOldestMsgId = null;
+    const placeholder = document.getElementById('chatMainPlaceholder');
+    const active = document.getElementById('chatActiveArea');
+    if (placeholder) placeholder.classList.remove('d-none');
+    if (active) active.classList.add('d-none');
+    hideReplyPanel();
+    await refreshChatAccounts();
+    await refreshChatSessions();
+}
+
+async function refreshChatSessions() {
+    const body = document.getElementById('chatSessionsBody');
+    if (!body) return;
+    if (!chatCurrentCookieId) {
+        body.innerHTML = '<div class="text-center text-muted py-4 small">请先选择账号</div>';
+        chatSessionsCache = [];
+        return;
+    }
+    body.innerHTML = '<div class="text-center text-muted py-4 small"><div class="spinner-border spinner-border-sm"></div></div>';
+    try {
+        const result = await fetchJSON(`${apiBase}/api/chat/sessions?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&include_order_fallback=true&limit=120`);
+        if (!result.success) {
+            body.innerHTML = '<div class="text-center text-muted py-4 small">加载失败</div>';
+            return;
+        }
+        chatSessionsCache = sortChatSessions(result.sessions || []);
+        chatSessionsCache = await enrichSessionsWithOrdersFallback(chatSessionsCache);
+        if (!chatSessionsCache.length) {
+            body.innerHTML = '<div class="text-center text-muted py-4 small">暂无会话记录；若该账号已有订单，会自动显示可补拉历史的会话入口</div>';
+            return;
+        }
+        renderChatSessions(chatSessionsCache);
+        mergeHydrationFallbackSessions();
+    } catch (error) {
+        console.error('获取会话列表失败:', error);
+        body.innerHTML = '<div class="text-center text-muted py-4 small">加载失败</div>';
+    }
+}
+
+function buildChatSessionsFromOrdersData(orders, cookieId) {
+    const sessions = [];
+    const seen = new Set();
+    (orders || []).forEach(order => {
+        if (String(order.cookie_id || '') !== String(cookieId || '')) return;
+        const sid = String(order.sid || '').trim();
+        if (!sid) return;
+        const chatId = sid.split('@')[0];
+        if (!chatId || seen.has(chatId)) return;
+        seen.add(chatId);
+        sessions.push({
+            chat_id: chatId,
+            sender_id: order.buyer_id || '',
+            buyer_id: order.buyer_id || '',
+            sender_name: order.buyer_nick || order.buyer_id || chatId,
+            buyer_name: order.buyer_nick || '',
+            content: '',
+            content_type: 1,
+            item_id: order.item_id || '',
+            direction: 2,
+            created_at: order.updated_at || order.platform_created_at || order.created_at || '',
+        });
+    });
+    sessions.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+    return sessions;
+}
+
+async function enrichSessionsWithOrdersFallback(existingSessions) {
+    const sessions = Array.isArray(existingSessions) ? [...existingSessions] : [];
+    if (!chatCurrentCookieId) return sessions;
+    const hasOnlySparseLocalSessions = sessions.length <= 1;
+    if (!hasOnlySparseLocalSessions) {
+        return sortChatSessions(sessions);
+    }
+    try {
+        const ordersResult = await fetchJSON(`${apiBase}/api/orders`);
+        const orderSessions = buildChatSessionsFromOrdersData(ordersResult?.data || [], chatCurrentCookieId);
+        return mergeChatSessionLists(sessions, orderSessions);
+    } catch (error) {
+        console.debug('从订单补充会话列表失败:', error);
+    }
+    return sortChatSessions(sessions);
+}
+
+function renderChatSessions(sessions) {
+    const body = document.getElementById('chatSessionsBody');
+    if (!body) return;
+    if (!sessions.length) {
+        body.innerHTML = '<div class="text-center text-muted py-4 small">暂无会话</div>';
+        return;
+    }
+    body.innerHTML = '';
+    sessions.forEach(session => {
+        const div = document.createElement('div');
+        div.className = 'chat-session-item' + (session.chat_id === chatCurrentChatId ? ' active' : '');
+        const displayName = resolveSessionDisplayName(session);
+        const avatar = resolveSessionAvatar(session);
+        const sessionState = getChatSessionState(session);
+        const preview = String(sessionState.preview || resolveSessionPreview(session)).substring(0, 30);
+        const baseSubMeta = String(sessionState.submeta || '').trim();
+        const priceMeta = session.item_price ? `<span class="chat-session-price">￥${escapeHtml(String(session.item_price))}</span>` : '';
+        div.innerHTML = `
+            <div class="chat-session-avatar">${avatar.type === 'image' ? `<img src="${escapeHtml(avatar.value)}" alt="avatar" class="chat-session-avatar-image">` : escapeHtml(avatar.value)}</div>
+            <div class="chat-session-info">
+                <div class="chat-session-name">${escapeHtml(displayName)}</div>
+                <div class="chat-session-preview">${escapeHtml(preview)}</div>
+                <div class="chat-session-submeta">${escapeHtml(baseSubMeta)}${priceMeta}</div>
+            </div>
+            <div class="chat-session-time">${escapeHtml(formatChatTime(session.created_at))}</div>
+        `;
+        div.onclick = () => selectChatSession(session);
+        body.appendChild(div);
+    });
+}
+
+function mergeHydrationFallbackSessions() {
+    if (!chatCurrentCookieId) return;
+    fetchJSON(`${apiBase}/api/chat/sessions?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&include_order_fallback=true&limit=120`)
+        .then(result => {
+            if (!result?.success || !Array.isArray(result.sessions)) return;
+            const mergedSessions = mergeChatSessionLists(chatSessionsCache, result.sessions);
+            if (mergedSessions.length !== chatSessionsCache.length) {
+                chatSessionsCache = mergedSessions;
+                renderChatSessions(chatSessionsCache);
+            }
+
+            if (chatSessionsCache.length <= 1) {
+                enrichSessionsWithOrdersFallback(chatSessionsCache)
+                    .then(mergedSessions => {
+                        if (Array.isArray(mergedSessions) && mergedSessions.length > chatSessionsCache.length) {
+                            chatSessionsCache = sortChatSessions(mergedSessions);
+                            renderChatSessions(chatSessionsCache);
+                        }
+                    })
+                    .catch(error => {
+                        console.debug('订单会话增强失败:', error);
+                    });
+            }
+        })
+        .catch(error => {
+            console.debug('补充可补拉会话失败:', error);
+        });
+}
+
+function filterChatSessions() {
+    const keyword = (document.getElementById('chatSearchInput')?.value || '').toLowerCase();
+    if (!keyword) {
+        renderChatSessions(sortChatSessions(chatSessionsCache));
+        return;
+    }
+    renderChatSessions(sortChatSessions(chatSessionsCache.filter(session =>
+        String(session.sender_name || '').toLowerCase().includes(keyword)
+        || String(session.buyer_name || '').toLowerCase().includes(keyword)
+        || String(session.chat_id || '').includes(keyword)
+        || String(normalizeChatSessionPreview(session.content, session.content_type) || '').toLowerCase().includes(keyword)
+    )));
+}
+
+async function selectChatSession(session) {
+    session = { ...session, content: normalizeChatSessionPreview(session?.content, session?.content_type) };
+    chatCurrentChatId = session.chat_id;
+    chatCurrentToUserId = session.buyer_id || (session.direction === 2 ? (session.sender_id || '') : '');
+    chatCurrentSenderName = resolveSessionDisplayName(session);
+    chatCurrentItemId = session.item_id || '';
+    chatOldestMsgId = null;
+
+    const placeholder = document.getElementById('chatMainPlaceholder');
+    const active = document.getElementById('chatActiveArea');
+    if (placeholder) placeholder.classList.add('d-none');
+    if (active) active.classList.remove('d-none');
+
+    const headerName = document.getElementById('chatHeaderName');
+    if (headerName) headerName.textContent = chatCurrentSenderName;
+    updateChatHeaderMeta(session);
+
+    renderChatSessions(chatSessionsCache);
+    await loadChatMessages(false);
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/chat/messages?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=50`);
+        if (result.success && Array.isArray(result.messages)) {
+            const buyerMessage = result.messages.find(message => message.direction === 2);
+            if (buyerMessage) {
+                if (!chatCurrentToUserId) chatCurrentToUserId = buyerMessage.sender_id;
+                if (!chatCurrentSenderName || chatCurrentSenderName === chatCurrentChatId) {
+                    chatCurrentSenderName = buyerMessage.sender_name || buyerMessage.sender_id || chatCurrentChatId;
+                    if (headerName) headerName.textContent = chatCurrentSenderName;
+                }
+            }
+            const messageWithItem = [...result.messages].reverse().find(message => {
+                const itemId = String(message.item_id || '');
+                return itemId && itemId !== 'None' && !itemId.startsWith('auto_');
+            });
+            if (messageWithItem) {
+                chatCurrentItemId = messageWithItem.item_id;
+                updateChatHeaderMeta({ ...session, item_id: chatCurrentItemId });
+            }
+        }
+    } catch (error) {
+        console.debug('补充会话信息失败:', error);
+    }
+
+    if (!document.getElementById('chatReplyPanel')?.classList.contains('d-none') && chatCurrentItemId) {
+        await loadItemKeywords();
+    }
+
+    document.getElementById('chatInputBox')?.focus();
+}
+
+function shouldForceHydrateSession(session) {
+    return false;
+}
+
+function shouldRebuildEmptySession(messages) {
+    return false;
+}
+
+function renderChatEmptyState(session) {
+    return `<div class="text-center text-muted py-4"><div class="small">暂无消息记录</div></div>`;
+}
+
+async function loadChatMessages(append = false) {
+    if (!chatCurrentCookieId || !chatCurrentChatId) return;
+    const area = document.getElementById('chatMessagesArea');
+    if (!area) return;
+    if (!append) {
+        area.innerHTML = '<div class="text-center text-muted py-4"><div class="spinner-border spinner-border-sm"></div></div>';
+    }
+
+    try {
+        let url = `${apiBase}/api/chat/messages?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=50`;
+        if (append && chatOldestMsgId) {
+            url += `&before_id=${chatOldestMsgId}`;
+        }
+        const result = await fetchJSON(url);
+        if (!result.success) {
+            if (!append) area.innerHTML = '<div class="text-center text-muted py-4">加载失败</div>';
+            return;
+        }
+        const messages = result.messages || [];
+        if (messages.length > 0) {
+            chatOldestMsgId = messages[0].id;
+        }
+        if (append) {
+            const previousHeight = area.scrollHeight;
+            area.insertAdjacentHTML('afterbegin', renderChatMessages(messages));
+            area.scrollTop = area.scrollHeight - previousHeight;
+        } else {
+            if (messages.length) {
+                area.innerHTML = renderChatMessages(messages);
+            } else {
+                const currentSession = chatSessionsCache.find(item => item.chat_id === chatCurrentChatId) || {};
+                area.innerHTML = renderChatEmptyState(currentSession);
+            }
+            area.scrollTop = area.scrollHeight;
+        }
+    } catch (error) {
+        console.error('加载消息失败:', error);
+        if (!append) area.innerHTML = '<div class="text-center text-muted py-4">加载失败</div>';
+    }
+}
+
+function loadMoreChatMessages() {
+    loadChatMessages(true);
+}
+
+function renderChatMessages(messages) {
+    let html = '';
+    let lastDate = '';
+    messages.forEach(message => {
+        const dateStr = String(message.created_at || '').substring(0, 10);
+        if (dateStr && dateStr !== lastDate) {
+            lastDate = dateStr;
+            html += `<div class="chat-date-divider"><span>${escapeHtml(dateStr)}</span></div>`;
+        }
+        const isOutgoing = message.direction === 1;
+        const timeStr = String(message.created_at || '').substring(11, 16);
+        let contentHtml = '';
+        const extra = (() => {
+            try {
+                return message.extra_json ? JSON.parse(message.extra_json) : null;
+            } catch (error) {
+                return null;
+            }
+        })();
+        const itemShare = extra?.item_share || null;
+        if (message.content_type === 2 && message.image_url) {
+            contentHtml = `<img src="${escapeHtml(message.image_url)}" class="chat-msg-image" onclick="window.open(this.src, '_blank')">`;
+            if (message.content && message.content !== '[图片]') {
+                contentHtml += `<div class="mt-1">${escapeHtml(message.content)}</div>`;
+            }
+        } else if (message.content_type === 3) {
+            const poster = message.image_url ? `<img src="${escapeHtml(message.image_url)}" class="chat-msg-image mb-2" onclick="window.open('${escapeHtml(message.media_url || message.image_url)}', '_blank')">` : '';
+            const link = message.media_url ? `<a href="${escapeHtml(message.media_url)}" target="_blank" rel="noopener noreferrer" class="chat-rich-link">打开视频</a>` : '';
+            contentHtml = `<div class="chat-rich-card">${poster}<div class="chat-rich-title">${escapeHtml(message.content || '[视频]')}</div>${link}</div>`;
+        } else if (message.content_type === 4) {
+            const linkTarget = message.link_url || extra?.payload?.targetUrl || '#';
+            contentHtml = `<div class="chat-rich-card"><div class="chat-rich-title">${escapeHtml(message.content || '[链接]')}</div><a href="${escapeHtml(linkTarget)}" target="_blank" rel="noopener noreferrer" class="chat-rich-link">打开链接</a></div>`;
+        } else if (message.content_type === 5) {
+            const linkTarget = message.link_url || '#';
+            const image = itemShare?.image_url || message.image_url;
+            contentHtml = `<div class="chat-rich-card chat-item-share-card">${image ? `<img src="${escapeHtml(image)}" class="chat-msg-image mb-2" onclick="window.open('${escapeHtml(linkTarget === '#' ? image : linkTarget)}', '_blank')">` : ''}<div class="chat-rich-title">${escapeHtml(itemShare?.title || message.content || '[商品分享]')}</div>${itemShare?.item_id ? `<div class="chat-rich-subtitle">商品ID: ${escapeHtml(String(itemShare.item_id))}</div>` : ''}${linkTarget && linkTarget !== '#' ? `<a href="${escapeHtml(linkTarget)}" target="_blank" rel="noopener noreferrer" class="chat-rich-link">查看商品</a>` : ''}</div>`;
+        } else if (message.content_type === 6) {
+            const buttonText = extra?.button_text;
+            const linkTarget = message.link_url || '#';
+            contentHtml = `<div class="chat-rich-card"><div class="chat-rich-title">${escapeHtml(extra?.title || message.content || '[系统卡片]')}</div>${buttonText ? `<div class="chat-rich-subtitle">${escapeHtml(buttonText)}</div>` : ''}${linkTarget && linkTarget !== '#' ? `<a href="${escapeHtml(linkTarget)}" target="_blank" rel="noopener noreferrer" class="chat-rich-link">打开卡片</a>` : ''}</div>`;
+        } else {
+            const normalizedContent = String(message.content || '').trim() || '[空消息]';
+            contentHtml = escapeHtml(normalizedContent).replace(/\n/g, '<br>');
+        }
+        const sourceHtml = message.reply_source ? `<span class="chat-msg-source">${escapeHtml(message.reply_source)}</span>` : '';
+        html += `<div class="chat-msg-row ${isOutgoing ? 'outgoing' : 'incoming'}"><div><div class="chat-msg-bubble">${contentHtml}</div><div class="chat-msg-meta">${escapeHtml(timeStr)}${sourceHtml}</div></div></div>`;
+    });
+    return html;
+}
+
+async function sendChatMessage() {
+    const input = document.getElementById('chatInputBox');
+    const message = String(input?.value || '').trim();
+    if (!message) return;
+    if (!chatCurrentCookieId || !chatCurrentChatId || !chatCurrentToUserId) {
+        showToast('无法发送：缺少会话信息', 'warning');
+        return;
+    }
+    const button = document.getElementById('chatSendBtn');
+    if (button) {
+        button.disabled = true;
+        button.textContent = '...';
+    }
+    try {
+        const result = await fetchJSON(`${apiBase}/api/chat/send`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                cookie_id: chatCurrentCookieId,
+                chat_id: chatCurrentChatId,
+                to_user_id: chatCurrentToUserId,
+                message,
+            })
+        });
+        if (result.success) {
+            if (input) input.value = '';
+        } else {
+            showToast(result.detail || result.message || '发送失败', 'danger');
+        }
+    } catch (error) {
+        console.error('发送消息失败:', error);
+        showToast('发送消息失败', 'danger');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '发送';
+        }
+    }
+}
+
+function appendChatMessage(message) {
+    const area = document.getElementById('chatMessagesArea');
+    if (!area) return;
+    const emptyHint = area.querySelector('.text-center.text-muted');
+    if (emptyHint) emptyHint.remove();
+    area.insertAdjacentHTML('beforeend', renderChatMessages([message]));
+    area.scrollTop = area.scrollHeight;
+}
+
+function handleChatInputKeydown(event) {
+    if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendChatMessage();
+    }
+}
+
+function initChatSSE() {
+    if (chatSseAbortController) {
+        chatSseAbortController.abort();
+        chatSseAbortController = null;
+    }
+    chatSseShouldRun = true;
+    chatSseRetryCount = 0;
+    connectChatStream();
+}
+
+async function connectChatStream() {
+    if (!chatSseShouldRun) return;
+    const controller = new AbortController();
+    chatSseAbortController = controller;
+    try {
+        const token = getAuthToken();
+        if (!token) {
+            stopChatStream();
+            return;
+        }
+        const response = await fetch(`${apiBase}/api/chat/stream`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'text/event-stream'
+            },
+            cache: 'no-store',
+            signal: controller.signal
+        });
+        if (!response.ok) {
+            if (response.status === 401) {
+                stopChatStream();
+                localStorage.removeItem('auth_token');
+                showToast('登录已失效，请重新登录', 'warning');
+                window.location.href = '/';
+                return;
+            }
+            throw new Error(`HTTP ${response.status}`);
+        }
+        chatSseRetryCount = 0;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const parts = buffer.split('\n\n');
+            buffer = parts.pop() || '';
+            for (const part of parts) {
+                processChatSSEEvent(part);
+            }
+        }
+    } catch (error) {
+        if (!controller.signal.aborted) {
+            chatSseRetryCount += 1;
+            setTimeout(() => connectChatStream(), Math.min(chatSseRetryCount * 3000, 30000));
+        }
+    }
+}
+
+function stopChatStream() {
+    chatSseShouldRun = false;
+    if (chatSseAbortController) {
+        chatSseAbortController.abort();
+        chatSseAbortController = null;
+    }
+}
+
+function processChatSSEEvent(raw) {
+    let eventType = 'message';
+    let dataStr = '';
+    for (const line of raw.split('\n')) {
+        if (line.startsWith('event: ')) {
+            eventType = line.substring(7).trim();
+        } else if (line.startsWith('data: ')) {
+            dataStr = line.substring(6);
+        }
+    }
+    if (eventType === 'ping' || !dataStr) return;
+
+    try {
+        const event = JSON.parse(dataStr);
+        const data = event.data || {};
+        data.cookie_id = data.cookie_id || event.cookie_id;
+        if (data.cookie_id !== chatCurrentCookieId) {
+            return;
+        }
+        updateSessionFromSSE(data);
+        if (data.chat_id === chatCurrentChatId) {
+            appendChatMessage({
+                msg_id: data.msg_id,
+                chat_id: data.chat_id,
+                sender_id: data.sender_id,
+                sender_name: data.sender_name,
+                content: data.content,
+                content_type: data.content_type,
+                image_url: data.image_url,
+                item_id: data.item_id,
+                direction: data.direction,
+                reply_source: data.reply_source,
+                media_url: data.media_url,
+                link_url: data.link_url,
+                extra_json: data.extra_json,
+                created_at: data.created_at || new Date().toISOString().replace('T', ' ').substring(0, 19)
+            });
+        }
+    } catch (error) {
+        console.error('SSE解析失败:', error);
+    }
+}
+
+function updateSessionFromSSE(data) {
+    const preview = {
+        chat_id: data.chat_id,
+        sender_id: data.sender_id,
+        sender_name: data.sender_name,
+        buyer_id: data.direction === 2 ? data.sender_id : undefined,
+        buyer_name: data.direction === 2 ? data.sender_name : undefined,
+        content: data.content,
+        content_type: data.content_type,
+        image_url: data.image_url,
+        item_id: data.item_id,
+        direction: data.direction,
+        created_at: data.created_at || new Date().toISOString().replace('T', ' ').substring(0, 19),
+    };
+    const index = chatSessionsCache.findIndex(session => session.chat_id === data.chat_id);
+    if (index >= 0) {
+        chatSessionsCache[index] = { ...chatSessionsCache[index], ...preview };
+        chatSessionsCache.unshift(chatSessionsCache.splice(index, 1)[0]);
+    } else {
+        chatSessionsCache.unshift(preview);
+    }
+    renderChatSessions(chatSessionsCache);
+}
+
+function toggleReplyPanel() {
+    const panel = document.getElementById('chatReplyPanel');
+    if (!panel) return;
+    panel.classList.toggle('d-none');
+    if (!panel.classList.contains('d-none') && chatCurrentItemId) {
+        loadItemKeywords();
+    }
+}
+
+function hideReplyPanel() {
+    document.getElementById('chatReplyPanel')?.classList.add('d-none');
+}
+
+async function loadItemKeywords() {
+    const replyItemId = document.getElementById('replyItemId');
+    const replyKeywordsList = document.getElementById('replyKeywordsList');
+    const replyItemReply = document.getElementById('replyItemReply');
+    if (!replyItemId || !replyKeywordsList || !replyItemReply) return;
+
+    if (!chatCurrentCookieId || !chatCurrentItemId) {
+        replyItemId.value = '未检测到商品';
+        replyKeywordsList.innerHTML = '<div class="text-muted small">无商品ID</div>';
+        replyItemReply.value = '';
+        return;
+    }
+
+    replyItemId.value = chatCurrentItemId;
+    replyKeywordsList.innerHTML = '<div class="text-muted small">加载中...</div>';
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/chat/keywords/${encodeURIComponent(chatCurrentCookieId)}/item/${encodeURIComponent(chatCurrentItemId)}`);
+        if (!result.success) {
+            replyKeywordsList.innerHTML = '<div class="text-danger small">加载失败</div>';
+            return;
+        }
+        replyItemReply.value = result.item_reply || '';
+        const keywords = result.keywords || [];
+        replyKeywordsList.innerHTML = '';
+        if (!keywords.length) {
+            replyKeywordsList.innerHTML = '<div class="text-muted small">暂无关键词，点击“添加”创建</div>';
+        } else {
+            keywords.forEach(keyword => addKeywordRowWithData(keyword.keyword, keyword.reply || ''));
+        }
+        await loadCopyTargetItems();
+    } catch (error) {
+        console.error('加载商品关键词失败:', error);
+        replyKeywordsList.innerHTML = '<div class="text-danger small">加载失败</div>';
+    }
+}
+
+function addKeywordRow() {
+    addKeywordRowWithData('', '');
+}
+
+function addKeywordRowWithData(keyword, reply) {
+    const list = document.getElementById('replyKeywordsList');
+    if (!list) return;
+    const hint = list.querySelector('.text-muted');
+    if (hint) hint.remove();
+    const row = document.createElement('div');
+    row.className = 'kw-row';
+    row.innerHTML = `
+        <input type="text" class="form-control form-control-sm" placeholder="关键词" value="${escapeHtml(keyword)}" style="flex:1;">
+        <input type="text" class="form-control form-control-sm" placeholder="回复内容" value="${escapeHtml(reply)}" style="flex:2;">
+        <button class="btn btn-outline-danger btn-sm" onclick="this.parentElement.remove()" title="删除"><i class="bi bi-trash"></i></button>
+    `;
+    list.appendChild(row);
+}
+
+async function saveItemKeywords() {
+    if (!chatCurrentCookieId || !chatCurrentItemId) {
+        showToast('缺少商品信息', 'warning');
+        return;
+    }
+    const itemReply = document.getElementById('replyItemReply')?.value || '';
+    const rows = document.querySelectorAll('#replyKeywordsList .kw-row');
+    const keywords = [];
+    rows.forEach(row => {
+        const inputs = row.querySelectorAll('input');
+        const keyword = inputs[0]?.value.trim();
+        const reply = inputs[1]?.value.trim();
+        if (keyword) {
+            keywords.push({ keyword, reply, type: 'text' });
         }
     });
 
-    if (!response.ok) {
-        throw new Error('获取账号详情失败');
-    }
-
-    return await response.json();
-}
-
-/**
- * 账号选择变化时的处理
- */
-async function onImAccountChange() {
-    const select = document.getElementById('imAccountSelect');
-    const usernameEl = document.getElementById('imDisplayUsername');
-    const passwordEl = document.getElementById('imDisplayPassword');
-
-    if (!select) return;
-
-    const selectedOption = select.selectedOptions[0];
-
-    if (selectedOption && selectedOption.value) {
-        const username = selectedOption.dataset.username || '未配置';
-
-        if (usernameEl) usernameEl.textContent = username;
-        if (passwordEl) {
-            passwordEl.textContent = '加载中...';
+    try {
+        const result = await fetchJSON(`${apiBase}/api/chat/keywords/${encodeURIComponent(chatCurrentCookieId)}/item/${encodeURIComponent(chatCurrentItemId)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ keywords, item_reply: itemReply })
+        });
+        if (result.success) {
+            showToast(`保存成功，${result.count} 条关键词`, 'success');
+        } else {
+            showToast(result.detail || result.message || '保存失败', 'danger');
         }
+    } catch (error) {
+        console.error('保存商品关键词失败:', error);
+        showToast('保存失败', 'danger');
+    }
+}
 
-        try {
-            const details = await fetchImAccountDetails(selectedOption.value);
-            const password = details.password || '';
-            if (passwordEl) {
-                passwordEl.textContent = password ? '••••••••' : '未配置';
-            }
-        } catch (error) {
-            if (passwordEl) {
-                passwordEl.textContent = '获取失败';
-            }
-            console.error('获取IM账号详情失败:', error);
-            showToast('获取账号密码失败，请稍后重试', 'warning');
+async function loadCopyTargetItems() {
+    if (!chatCurrentCookieId) return;
+    const container = document.getElementById('copyTargetItems');
+    if (!container) return;
+    container.innerHTML = '<div class="text-muted small">加载商品...</div>';
+    try {
+        const result = await fetchJSON(`${apiBase}/api/chat/items/${encodeURIComponent(chatCurrentCookieId)}`);
+        if (!result.success) {
+            container.innerHTML = '<div class="text-muted small">加载失败</div>';
+            return;
         }
-    } else {
-        // 未选择账号时显示默认值
-        if (usernameEl) usernameEl.textContent = '-';
-        if (passwordEl) passwordEl.textContent = '-';
+        const items = (result.items || []).filter(item => item.item_id !== chatCurrentItemId);
+        if (!items.length) {
+            container.innerHTML = '<div class="text-muted small">无其他商品</div>';
+            return;
+        }
+        container.innerHTML = '';
+        items.forEach(item => {
+            const div = document.createElement('div');
+            div.className = 'copy-target-item';
+            const safeValue = escapeHtml(item.item_id);
+            const checkboxId = buildSafeCheckboxId('ct', item.item_id);
+            div.innerHTML = `<input type="checkbox" value="${safeValue}" id="${checkboxId}"><label for="${checkboxId}">${escapeHtml(item.item_title || item.item_id)}</label>`;
+            container.appendChild(div);
+        });
+    } catch (error) {
+        console.error('加载可复用商品失败:', error);
+        container.innerHTML = '<div class="text-muted small">加载失败</div>';
     }
 }
 
-/**
- * 复制账号到剪贴板
- */
-async function copyImUsername() {
-    const usernameEl = document.getElementById('imDisplayUsername');
-    const username = usernameEl ? usernameEl.textContent : '';
-
-    if (!username || username === '未配置' || username === '-') {
-        showToast('账号未配置', 'warning');
+async function copyKeywordsToSelected() {
+    if (!chatCurrentCookieId || !chatCurrentItemId) {
+        showToast('缺少源商品信息', 'warning');
         return;
     }
-
+    const checks = document.querySelectorAll('#copyTargetItems input[type=checkbox]:checked');
+    const targets = [...checks].map(check => check.value);
+    if (!targets.length) {
+        showToast('请先选择目标商品', 'warning');
+        return;
+    }
     try {
-        await navigator.clipboard.writeText(username);
-        showToast('账号已复制', 'success');
+        const result = await fetchJSON(`${apiBase}/api/chat/keywords/${encodeURIComponent(chatCurrentCookieId)}/copy`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source_item_id: chatCurrentItemId, target_item_ids: targets })
+        });
+        if (result.success) {
+            showToast(`已复制到 ${targets.length} 个商品，共 ${result.total} 条关键词`, 'success');
+        } else {
+            showToast(result.detail || result.message || '复制失败', 'danger');
+        }
     } catch (error) {
-        fallbackCopy(username, '账号已复制', '复制失败');
+        console.error('复制关键词失败:', error);
+        showToast('复制失败', 'danger');
     }
 }
 
-/**
- * 复制密码到剪贴板
- */
-async function copyImPassword() {
-    const select = document.getElementById('imAccountSelect');
-    if (!select || !select.value) {
-        showToast('请先选择账号', 'warning');
-        return;
-    }
-
-    let password = '';
-
-    try {
-        const details = await fetchImAccountDetails(select.value);
-        password = details.password || '';
-    } catch (error) {
-        console.error('获取密码失败:', error);
-        showToast('获取密码失败，请稍后重试', 'danger');
-        return;
-    }
-
-    if (!password || password === '未配置') {
-        showToast('密码未配置', 'warning');
-        return;
-    }
-
-    try {
-        await navigator.clipboard.writeText(password);
-        showToast('密码已复制', 'success');
-    } catch (error) {
-        fallbackCopy(password, '密码已复制', '复制失败');
-    }
+function formatChatTime(ts) {
+    if (!ts) return '';
+    const d = new Date(String(ts).replace(' ', 'T'));
+    if (isNaN(d.getTime())) return String(ts || '').substring(11, 16);
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) return d.toTimeString().substring(0, 5);
+    const yesterday = new Date(now);
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (d.toDateString() === yesterday.toDateString()) return '昨天';
+    return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
-/**
- * 降级复制方案
- */
-function fallbackCopy(text, successMsg, failMsg) {
-    const textArea = document.createElement('textarea');
-    textArea.value = text;
-    textArea.style.position = 'fixed';
-    textArea.style.left = '-9999px';
-    document.body.appendChild(textArea);
-    textArea.select();
-
-    try {
-        document.execCommand('copy');
-        showToast(successMsg, 'success');
-    } catch (e) {
-        showToast(failMsg, 'danger');
-    }
-
-    document.body.removeChild(textArea);
+function loadOnlineIm() {
+    refreshChatAccounts();
+    initChatSSE();
 }
 
-/**
- * 复制账号密码到剪贴板（保留兼容）
- */
-async function copyImAccountInfo() {
-    const select = document.getElementById('imAccountSelect');
-
-    if (!select || !select.value) {
-        showToast('请先选择一个账号', 'warning');
-        return;
-    }
-
-    const selectedOption = select.selectedOptions[0];
-    const username = selectedOption.dataset.username || '';
-    let password = '';
-
-    try {
-        const details = await fetchImAccountDetails(select.value);
-        password = details.password || '';
-    } catch (error) {
-        console.error('获取账号密码失败:', error);
-        showToast('获取账号密码失败，请稍后重试', 'danger');
-        return;
-    }
-
-    if (!username && !password) {
-        showToast('该账号未配置用户名和密码', 'warning');
-        return;
-    }
-
-    const copyText = `账号：${username}\n密码：${password}`;
-
-    try {
-        await navigator.clipboard.writeText(copyText);
-        showToast('账号密码已复制到剪贴板', 'success');
-    } catch (error) {
-        fallbackCopy(copyText, '账号密码已复制到剪贴板', '复制失败，请手动复制');
-    }
+function loadImAccountList() {
+    refreshChatAccounts();
 }
 
-/**
- * 刷新IM iframe
- */
+function onImAccountChange() {}
+
 function refreshImIframe() {
-    const iframe = document.getElementById('goofishImIframe');
-    if (iframe) {
-        iframe.src = iframe.src;
-        showToast('页面已刷新', 'success');
-    }
+    refreshChatSessions();
 }
 
-/**
- * 在新窗口打开闲鱼IM
- */
 function openGoofishImNewWindow() {
     window.open('https://www.goofish.com/im', '_blank');
 }
 
-/**
- * 兼容旧版函数名
- */
 function openGoofishIm() {
     openGoofishImNewWindow();
-}
-
-/**
- * 加载在线客服页面
- */
-function loadOnlineIm() {
-    loadImAccountList();
-
-    // 延迟加载 iframe，避免页面加载时直接加载闲鱼导致跳转问题
-    const iframe = document.getElementById('goofishImIframe');
-    if (iframe && iframe.src === 'about:blank') {
-        const realSrc = iframe.dataset.src || 'https://www.goofish.com/im';
-        iframe.src = realSrc;
-    }
 }
 
 // ==================== 定时擦亮任务管理 ====================
