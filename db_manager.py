@@ -9267,9 +9267,13 @@ Cookie数量: {cookie_count}
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                # 过滤 sender_name 中混入的系统文案/订单状态文本，避免污染 buyer_name
+                # （例如 "买家已拍下，待付款"、"工作台通知" 等会被当成买家昵称显示）
+                # SQLite 的 CURRENT_TIMESTAMP 落库为 UTC，对外统一转换为北京时间（UTC+8）给前端展示
                 self._execute_sql(cursor, """
                     SELECT m.chat_id, m.sender_name, m.content, m.content_type,
-                           m.item_id, m.created_at, m.direction, m.sender_id,
+                           m.item_id, datetime(m.created_at, '+8 hours') AS created_at,
+                           m.direction, m.sender_id,
                            buyer.buyer_name, buyer.buyer_id
                     FROM chat_messages m
                     INNER JOIN (
@@ -9281,7 +9285,23 @@ Cookie数量: {cookie_count}
                     LEFT JOIN (
                         SELECT chat_id, sender_name AS buyer_name, sender_id AS buyer_id
                         FROM chat_messages
-                        WHERE cookie_id = ? AND direction = 2 AND sender_name != ''
+                        WHERE cookie_id = ? AND direction = 2
+                          AND sender_name IS NOT NULL AND sender_name != ''
+                          AND sender_name NOT IN ('未知用户', '工作台通知', '订单', '交易消息', '买家', '全部')
+                          AND sender_name NOT LIKE '%待付款%'
+                          AND sender_name NOT LIKE '%待发货%'
+                          AND sender_name NOT LIKE '%已发货%'
+                          AND sender_name NOT LIKE '%拍下%'
+                          AND sender_name NOT LIKE '%付款%'
+                          AND sender_name NOT LIKE '%发货%'
+                          AND sender_name NOT LIKE '%收货%'
+                          AND sender_name NOT LIKE '%退款%'
+                          AND sender_name NOT LIKE '%评价%'
+                          AND sender_name NOT LIKE '%交易%'
+                          AND sender_name NOT LIKE '%关闭%'
+                          AND sender_name NOT LIKE '%确认%'
+                          AND sender_name NOT LIKE '%小红花%'
+                          AND sender_name NOT LIKE '%等待%'
                         GROUP BY chat_id
                     ) buyer ON m.chat_id = buyer.chat_id
                     WHERE m.cookie_id = ?
@@ -9304,7 +9324,8 @@ Cookie数量: {cookie_count}
                     self._execute_sql(cursor, """
                         SELECT id, cookie_id, chat_id, sender_id, sender_name, content,
                                content_type, image_url, item_id, direction, reply_source,
-                               media_url, link_url, extra_json, created_at
+                               media_url, link_url, extra_json,
+                               datetime(created_at, '+8 hours') AS created_at
                         FROM chat_messages
                         WHERE cookie_id = ? AND chat_id = ? AND id < ?
                         ORDER BY id DESC
@@ -9314,7 +9335,8 @@ Cookie数量: {cookie_count}
                     self._execute_sql(cursor, """
                         SELECT id, cookie_id, chat_id, sender_id, sender_name, content,
                                content_type, image_url, item_id, direction, reply_source,
-                               media_url, link_url, extra_json, created_at
+                               media_url, link_url, extra_json,
+                               datetime(created_at, '+8 hours') AS created_at
                         FROM chat_messages
                         WHERE cookie_id = ? AND chat_id = ?
                         ORDER BY id DESC
