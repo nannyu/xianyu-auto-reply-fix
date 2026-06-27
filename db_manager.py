@@ -196,6 +196,8 @@ class DBManager:
             '处理中': 'processing',
             '待发货': 'pending_ship',
             '部分发货': 'partial_success',
+            '待补确认': 'partial_pending_finalize',
+            '卡券已发出、平台确认失败、等待补确认': 'partial_pending_finalize',
             '部分待收尾': 'partial_pending_finalize',
             '已发货': 'shipped',
             '已完成': 'completed',
@@ -323,6 +325,7 @@ class DBManager:
                 value TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
                 auto_confirm INTEGER DEFAULT 1,
+                auto_red_flower INTEGER DEFAULT 0,
                 remark TEXT DEFAULT '',
                 status_note TEXT DEFAULT '',
                 qr_login_grace_until INTEGER DEFAULT 0,
@@ -336,6 +339,65 @@ class DBManager:
             ''')
 
             
+            # 创建个人黑名单表
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS xy_personal_blacklist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                cookie_id TEXT,
+                buyer_id TEXT NOT NULL,
+                buyer_nick TEXT DEFAULT '',
+                item_id TEXT,
+                reason TEXT DEFAULT '',
+                is_enabled INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_xy_personal_blacklist_user_buyer ON xy_personal_blacklist(user_id, buyer_id)")
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_xy_personal_blacklist_scope ON xy_personal_blacklist(user_id, buyer_id, cookie_id, item_id, is_enabled)")
+
+            # 创建平台黑名单表（预留平台同步能力）
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS xy_platform_blacklist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                buyer_id TEXT NOT NULL,
+                buyer_nick TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            ''')
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_xy_platform_blacklist_user_buyer ON xy_platform_blacklist(user_id, buyer_id)")
+
+            # 创建消息过滤规则表
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS xy_message_filter_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                cookie_id TEXT,
+                item_id TEXT,
+                name TEXT NOT NULL,
+                match_type TEXT DEFAULT 'contains',
+                patterns TEXT NOT NULL,
+                message_source TEXT DEFAULT 'user',
+                is_enabled INTEGER DEFAULT 1,
+                action_skip_auto_reply INTEGER DEFAULT 1,
+                action_skip_ai_reply INTEGER DEFAULT 0,
+                action_pause_minutes INTEGER DEFAULT 0,
+                action_notify INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_xy_message_filter_rules_user_enabled ON xy_message_filter_rules(user_id, is_enabled)")
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_xy_message_filter_rules_scope ON xy_message_filter_rules(user_id, cookie_id, item_id, is_enabled)")
+
             # 创建keywords表
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS keywords (
@@ -468,6 +530,12 @@ class DBManager:
                 platform_created_at TIMESTAMP,
                 platform_paid_at TIMESTAMP,
                 platform_completed_at TIMESTAMP,
+                is_rated INTEGER DEFAULT 0,
+                rated_at TIMESTAMP,
+                rate_error TEXT,
+                is_red_flower INTEGER DEFAULT 0,
+                red_flower_at TIMESTAMP,
+                red_flower_error TEXT,
                 cookie_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -938,6 +1006,7 @@ Cookie数量: {cookie_count}
             ('verification_email_api_url', '', '验证码邮件 API 地址（留空则仅使用 SMTP，不再向旧硬编码地址外发）'),
             ('qq_notification_api_url', '', 'QQ 私信通知 API 地址（留空则禁用 QQ 私信通知）'),
             ('auto_comment_api_url', '', '自动好评辅助 API 地址（留空则禁用此功能，避免 Cookie 外发）'),
+            ('auto_red_flower_interval_seconds', '300', '自动求小红花后台任务检查间隔秒数'),
             ('qq_reply_secret_key', 'xianyu_qq_reply_2024', 'QQ回复消息API秘钥')
             ''')
 
@@ -1000,8 +1069,18 @@ Cookie数量: {cookie_count}
                 cursor.execute("ALTER TABLE cookies ADD COLUMN auto_comment INTEGER DEFAULT 0")
                 logger.info("数据库迁移完成：添加auto_comment列")
 
+            if 'auto_red_flower' not in cookie_columns:
+                logger.info("添加cookies表的auto_red_flower列...")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN auto_red_flower INTEGER DEFAULT 0")
+                logger.info("数据库迁移完成：添加auto_red_flower列")
+
             # 历史版本可能缺少订单平台时间字段，不能再依赖旧版本号分支触发
             self._ensure_orders_platform_time_columns(cursor)
+            self._ensure_orders_auto_comment_columns(cursor)
+            self._ensure_scheduled_rate_logs_table(cursor)
+            self._ensure_scheduled_red_flower_logs_table(cursor)
+            self._ensure_scheduled_task_logs_table(cursor)
+            self._ensure_product_publish_tables(cursor)
 
             # 迁移notification_templates表以支持新的模板类型
             self._migrate_notification_templates(cursor)
@@ -1067,6 +1146,149 @@ Cookie数量: {cookie_count}
             except sqlite3.OperationalError:
                 self._execute_sql(cursor, f"ALTER TABLE orders ADD COLUMN {order_time_column} TIMESTAMP")
                 logger.info(f"为orders表添加平台时间字段({order_time_column})")
+
+    def _ensure_orders_auto_comment_columns(self, cursor):
+        """确保 orders 表存在自动评价状态字段。"""
+        column_defs = {
+            "is_rated": "INTEGER DEFAULT 0",
+            "rated_at": "TIMESTAMP",
+            "rate_error": "TEXT",
+            "is_red_flower": "INTEGER DEFAULT 0",
+            "red_flower_at": "TIMESTAMP",
+            "red_flower_error": "TEXT",
+        }
+        for column_name, column_def in column_defs.items():
+            try:
+                self._execute_sql(cursor, f"SELECT {column_name} FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                self._execute_sql(cursor, f"ALTER TABLE orders ADD COLUMN {column_name} {column_def}")
+                logger.info(f"为orders表添加自动评价字段({column_name})")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_orders_auto_comment ON orders(cookie_id, order_status, is_rated, updated_at)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_orders_red_flower ON orders(cookie_id, order_status, is_red_flower, updated_at)")
+
+    def _ensure_scheduled_rate_logs_table(self, cursor):
+        """创建自动评价执行日志表。"""
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS scheduled_rate_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            cookie_id TEXT NOT NULL,
+            order_id TEXT,
+            item_id TEXT,
+            buyer_id TEXT,
+            buyer_nick TEXT,
+            comment TEXT,
+            status TEXT NOT NULL,
+            message TEXT,
+            raw_response TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        )
+        ''')
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_rate_logs_cookie_time ON scheduled_rate_logs(cookie_id, created_at DESC)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_rate_logs_batch ON scheduled_rate_logs(batch_id)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_rate_logs_order ON scheduled_rate_logs(order_id)")
+
+    def _ensure_scheduled_red_flower_logs_table(self, cursor):
+        """创建求小红花执行日志表。"""
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS scheduled_red_flower_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            cookie_id TEXT NOT NULL,
+            order_id TEXT,
+            item_id TEXT,
+            buyer_id TEXT,
+            buyer_nick TEXT,
+            status TEXT NOT NULL,
+            message TEXT,
+            raw_response TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        )
+        ''')
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_red_flower_logs_cookie_time ON scheduled_red_flower_logs(cookie_id, created_at DESC)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_red_flower_logs_batch ON scheduled_red_flower_logs(batch_id)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_red_flower_logs_order ON scheduled_red_flower_logs(order_id)")
+
+    def _ensure_scheduled_task_logs_table(self, cursor):
+        """创建通用任务执行日志表。"""
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS scheduled_task_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            task_type TEXT NOT NULL,
+            cookie_id TEXT NOT NULL,
+            object_id TEXT,
+            order_id TEXT,
+            item_id TEXT,
+            buyer_id TEXT,
+            buyer_nick TEXT,
+            status TEXT NOT NULL,
+            message TEXT,
+            raw_response TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        )
+        ''')
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_task_logs_type_time ON scheduled_task_logs(task_type, created_at DESC)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_task_logs_cookie_time ON scheduled_task_logs(cookie_id, created_at DESC)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_task_logs_batch ON scheduled_task_logs(batch_id)")
+
+    def _ensure_product_publish_tables(self, cursor):
+        """创建商品发布素材和发布日志表。"""
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS product_materials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            price REAL,
+            original_price REAL,
+            category TEXT,
+            images TEXT,
+            delivery_method TEXT DEFAULT '包邮',
+            postage REAL DEFAULT 0,
+            can_self_pickup INTEGER DEFAULT 0,
+            brand TEXT,
+            condition TEXT DEFAULT '全新',
+            remark TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        ''')
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_product_materials_user_time ON product_materials(user_id, created_at DESC)")
+
+        self._execute_sql(cursor, '''
+        CREATE TABLE IF NOT EXISTS publish_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            account_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            price TEXT,
+            material_id INTEGER,
+            batch_id TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            item_url TEXT,
+            item_id TEXT,
+            error_message TEXT,
+            sync_status TEXT,
+            sync_message TEXT,
+            sync_total_count INTEGER DEFAULT 0,
+            sync_saved_count INTEGER DEFAULT 0,
+            raw_response TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (account_id) REFERENCES cookies(id) ON DELETE CASCADE,
+            FOREIGN KEY (material_id) REFERENCES product_materials(id) ON DELETE SET NULL
+        )
+        ''')
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_publish_logs_user_time ON publish_logs(user_id, created_at DESC)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_publish_logs_batch ON publish_logs(batch_id)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_publish_logs_account_status ON publish_logs(account_id, status, created_at DESC)")
 
     def _update_cards_table_constraints(self, cursor):
         """更新cards表的CHECK约束以支持image和yifan_api类型"""
@@ -2454,6 +2676,39 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"获取自动确认发货设置失败: {e}")
                 return True  # 出错时默认开启
+
+    # -------------------- 自动求小红花操作 --------------------
+    def get_auto_red_flower(self, cookie_id: str) -> bool:
+        """获取Cookie的自动求小红花设置。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT auto_red_flower FROM cookies WHERE id = ?", (cookie_id,))
+                result = cursor.fetchone()
+                if result and result[0] is not None:
+                    return bool(result[0])
+                return False
+            except Exception as e:
+                logger.error(f"获取自动求小红花设置失败: {e}")
+                return False
+
+    def update_auto_red_flower(self, cookie_id: str, auto_red_flower: bool) -> bool:
+        """更新Cookie的自动求小红花设置。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET auto_red_flower = ? WHERE id = ?",
+                    (int(auto_red_flower), cookie_id)
+                )
+                self.conn.commit()
+                logger.info(f"更新账号 {cookie_id} 自动求小红花设置: {'开启' if auto_red_flower else '关闭'}")
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新自动求小红花设置失败: {e}")
+                self.conn.rollback()
+                return False
 
     # -------------------- 自动好评操作 --------------------
     def get_auto_comment(self, cookie_id: str) -> bool:
@@ -5197,6 +5452,68 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取订单全部发货 finalize 状态失败: {e}")
                 return []
 
+    def get_pending_platform_confirm_states(self, cookie_id: str = None, order_id: str = None, limit: int = 100):
+        """获取“卡券已发出但平台确认失败，等待补确认”的发货单元。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                safe_limit = max(1, min(int(limit or 100), 500))
+                conditions = ["status = 'sent'"]
+                params = []
+
+                if cookie_id:
+                    conditions.append("cookie_id = ?")
+                    params.append(cookie_id)
+                if order_id:
+                    conditions.append("order_id = ?")
+                    params.append(order_id)
+
+                conditions.append("""
+                (
+                    COALESCE(last_error, '') LIKE '%平台确认发货失败%'
+                    OR COALESCE(last_error, '') LIKE '%自动确认发货失败%'
+                    OR COALESCE(delivery_meta, '') LIKE '%"pending_platform_confirm"%'
+                    OR COALESCE(delivery_meta, '') LIKE '%"platform_confirm_status": "failed"%'
+                    OR COALESCE(delivery_meta, '') LIKE '%"confirm_retry_required"%'
+                )
+                """)
+
+                params.append(safe_limit)
+                self._execute_sql(cursor, f'''
+                SELECT order_id, unit_index, cookie_id, item_id, buyer_id, channel, status,
+                       delivery_meta, last_error, sent_at, finalized_at, created_at, updated_at
+                FROM delivery_finalization_states
+                WHERE {' AND '.join(conditions)}
+                ORDER BY datetime(updated_at) ASC, id ASC
+                LIMIT ?
+                ''', tuple(params))
+
+                states = []
+                for row in cursor.fetchall():
+                    try:
+                        delivery_meta = json.loads(row[7] or '{}')
+                    except Exception:
+                        delivery_meta = {}
+                    states.append({
+                        'order_id': row[0],
+                        'unit_index': row[1],
+                        'cookie_id': row[2],
+                        'item_id': row[3],
+                        'buyer_id': row[4],
+                        'channel': row[5],
+                        'status': row[6],
+                        'delivery_meta': delivery_meta,
+                        'last_error': row[8],
+                        'sent_at': row[9],
+                        'finalized_at': row[10],
+                        'created_at': row[11],
+                        'updated_at': row[12],
+                    })
+                return states
+            except Exception as e:
+                logger.error(f"获取待补确认发货单元失败: {e}")
+                return []
+
     def get_delivery_progress_summary(self, order_id: str, expected_quantity: int = 1):
         """汇总订单的多数量发货进度。"""
         try:
@@ -7006,7 +7323,8 @@ Cookie数量: {cookie_count}
                 SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
                        spec_name_2, spec_value_2, quantity, amount, bargain_flow_detected, bargain_success_detected,
                        order_status, pre_refund_status, cookie_id, platform_created_at, platform_paid_at,
-                       platform_completed_at, created_at, updated_at
+                       platform_completed_at, is_rated, rated_at, rate_error,
+                       is_red_flower, red_flower_at, red_flower_error, created_at, updated_at
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -7032,8 +7350,14 @@ Cookie数量: {cookie_count}
                         'platform_created_at': row[16],
                         'platform_paid_at': row[17],
                         'platform_completed_at': row[18],
-                        'created_at': row[19],
-                        'updated_at': row[20]
+                        'is_rated': bool(row[19]),
+                        'rated_at': row[20],
+                        'rate_error': row[21],
+                        'is_red_flower': bool(row[22]),
+                        'red_flower_at': row[23],
+                        'red_flower_error': row[24],
+                        'created_at': row[25],
+                        'updated_at': row[26]
                     }
                 return None
 
@@ -7094,7 +7418,9 @@ Cookie数量: {cookie_count}
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
                        spec_name_2, spec_value_2, quantity, amount, order_status,
-                       platform_created_at, platform_paid_at, platform_completed_at, created_at, updated_at
+                       platform_created_at, platform_paid_at, platform_completed_at,
+                       is_rated, rated_at, rate_error,
+                       is_red_flower, red_flower_at, red_flower_error, created_at, updated_at
                 FROM orders WHERE cookie_id = ?
                 ORDER BY created_at DESC LIMIT ?
                 ''', (cookie_id, limit))
@@ -7120,14 +7446,406 @@ Cookie数量: {cookie_count}
                         'platform_created_at': row[12],
                         'platform_paid_at': row[13],
                         'platform_completed_at': row[14],
-                        'created_at': row[15],
-                        'updated_at': row[16]
+                        'is_rated': bool(row[15]),
+                        'rated_at': row[16],
+                        'rate_error': row[17],
+                        'is_red_flower': bool(row[18]),
+                        'red_flower_at': row[19],
+                        'red_flower_error': row[20],
+                        'created_at': row[21],
+                        'updated_at': row[22]
                     })
 
                 return orders
 
             except Exception as e:
                 logger.error(f"获取Cookie订单列表失败: {cookie_id} - {e}")
+                return []
+
+    def mark_order_rated(self, order_id: str, is_rated: bool = True, error_message: str = None) -> bool:
+        """更新订单评价状态。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if is_rated:
+                    cursor.execute('''
+                    UPDATE orders
+                    SET is_rated = 1, rated_at = CURRENT_TIMESTAMP, rate_error = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = ?
+                    ''', (order_id,))
+                else:
+                    cursor.execute('''
+                    UPDATE orders
+                    SET rate_error = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = ?
+                    ''', (str(error_message or '')[:1000], order_id))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新订单评价状态失败: order_id={order_id}, error={e}")
+                self.conn.rollback()
+                return False
+
+    def mark_order_red_flower(self, order_id: str, is_red_flower: bool = True, error_message: str = None) -> bool:
+        """更新订单求小红花状态。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if is_red_flower:
+                    cursor.execute('''
+                    UPDATE orders
+                    SET is_red_flower = 1, red_flower_at = CURRENT_TIMESTAMP, red_flower_error = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = ?
+                    ''', (order_id,))
+                else:
+                    cursor.execute('''
+                    UPDATE orders
+                    SET red_flower_error = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = ?
+                    ''', (str(error_message or '')[:1000], order_id))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新订单求小红花状态失败: order_id={order_id}, error={e}")
+                self.conn.rollback()
+                return False
+
+    def add_scheduled_rate_log(self, batch_id: str, cookie_id: str, order_id: str = None,
+                               item_id: str = None, buyer_id: str = None, buyer_nick: str = None,
+                               comment: str = None, status: str = 'failed', message: str = None,
+                               raw_response: Any = None) -> Optional[int]:
+        """写入自动评价执行日志。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if raw_response is None:
+                    raw_text = None
+                elif isinstance(raw_response, str):
+                    raw_text = raw_response
+                else:
+                    raw_text = json.dumps(raw_response, ensure_ascii=False, default=str)
+                cursor.execute('''
+                INSERT INTO scheduled_rate_logs (
+                    batch_id, cookie_id, order_id, item_id, buyer_id, buyer_nick,
+                    comment, status, message, raw_response
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    batch_id, cookie_id, order_id, item_id, buyer_id, buyer_nick,
+                    comment, status, message, raw_text
+                ))
+                log_id = cursor.lastrowid
+                self.conn.commit()
+                return log_id
+            except Exception as e:
+                logger.error(f"写入自动评价日志失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def get_scheduled_rate_logs(self, user_id: int = None, cookie_id: str = None,
+                                limit: int = 100, offset: int = 0) -> List[Dict]:
+        """查询自动评价日志。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                conditions = []
+                params = []
+                if user_id is not None:
+                    conditions.append("c.user_id = ?")
+                    params.append(user_id)
+                if cookie_id:
+                    conditions.append("l.cookie_id = ?")
+                    params.append(cookie_id)
+                where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+                params.extend([max(1, min(int(limit or 100), 500)), max(0, int(offset or 0))])
+                cursor.execute(f'''
+                SELECT l.id, l.batch_id, l.cookie_id, l.order_id, l.item_id, l.buyer_id,
+                       l.buyer_nick, l.comment, l.status, l.message, l.raw_response, l.created_at
+                FROM scheduled_rate_logs l
+                LEFT JOIN cookies c ON c.id = l.cookie_id
+                {where_sql}
+                ORDER BY l.created_at DESC, l.id DESC
+                LIMIT ? OFFSET ?
+                ''', params)
+                logs = []
+                for row in cursor.fetchall():
+                    logs.append({
+                        'id': row[0],
+                        'batch_id': row[1],
+                        'cookie_id': row[2],
+                        'order_id': row[3],
+                        'item_id': row[4],
+                        'buyer_id': row[5],
+                        'buyer_nick': row[6],
+                        'comment': row[7],
+                        'status': row[8],
+                        'message': row[9],
+                        'raw_response': row[10],
+                        'created_at': row[11],
+                    })
+                return logs
+            except Exception as e:
+                logger.error(f"查询自动评价日志失败: {e}")
+                return []
+
+    def get_pending_auto_comment_orders(self, cookie_id: str, limit: int = 5,
+                                        days: int = 10, cooldown_minutes: int = 30) -> List[Dict]:
+        """获取待自动补评价订单。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT o.order_id, o.item_id, o.buyer_id, o.buyer_nick, o.sid,
+                       o.order_status, o.cookie_id, o.platform_completed_at, o.created_at, o.updated_at,
+                       o.is_rated, o.rated_at, o.rate_error
+                FROM orders o
+                WHERE o.cookie_id = ?
+                  AND o.order_status = 'completed'
+                  AND COALESCE(o.is_rated, 0) = 0
+                  AND datetime(COALESCE(o.platform_completed_at, o.updated_at, o.created_at)) >= datetime('now', ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM scheduled_rate_logs l
+                      WHERE l.order_id = o.order_id
+                        AND l.status IN ('failed', 'cookie_expired')
+                        AND datetime(l.created_at) >= datetime('now', ?)
+                  )
+                ORDER BY datetime(COALESCE(o.platform_completed_at, o.updated_at, o.created_at)) DESC
+                LIMIT ?
+                ''', (cookie_id, f'-{max(1, int(days or 10))} days', f'-{max(1, int(cooldown_minutes or 30))} minutes', max(1, min(int(limit or 5), 50))))
+                orders = []
+                for row in cursor.fetchall():
+                    buyer_nick = self._sanitize_order_buyer_nick(row[3])
+                    if not buyer_nick:
+                        buyer_nick = self._lookup_buyer_nick_from_chat_messages(cookie_id, row[4], row[2])
+                    orders.append({
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'buyer_nick': buyer_nick,
+                        'sid': row[4],
+                        'order_status': row[5],
+                        'cookie_id': row[6],
+                        'platform_completed_at': row[7],
+                        'created_at': row[8],
+                        'updated_at': row[9],
+                        'is_rated': bool(row[10]),
+                        'rated_at': row[11],
+                        'rate_error': row[12],
+                    })
+                return orders
+            except Exception as e:
+                logger.error(f"查询待自动评价订单失败: cookie_id={cookie_id}, error={e}")
+                return []
+
+    def add_scheduled_red_flower_log(self, batch_id: str, cookie_id: str, order_id: str = None,
+                                     item_id: str = None, buyer_id: str = None, buyer_nick: str = None,
+                                     status: str = 'failed', message: str = None,
+                                     raw_response: Any = None) -> Optional[int]:
+        """写入求小红花执行日志。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if raw_response is None:
+                    raw_text = None
+                elif isinstance(raw_response, str):
+                    raw_text = raw_response
+                else:
+                    raw_text = json.dumps(raw_response, ensure_ascii=False, default=str)
+                cursor.execute('''
+                INSERT INTO scheduled_red_flower_logs (
+                    batch_id, cookie_id, order_id, item_id, buyer_id, buyer_nick,
+                    status, message, raw_response
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    batch_id, cookie_id, order_id, item_id, buyer_id, buyer_nick,
+                    status, message, raw_text
+                ))
+                log_id = cursor.lastrowid
+                self.conn.commit()
+                return log_id
+            except Exception as e:
+                logger.error(f"写入求小红花日志失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def get_scheduled_red_flower_logs(self, user_id: int = None, cookie_id: str = None,
+                                      limit: int = 100, offset: int = 0) -> List[Dict]:
+        """查询求小红花日志。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                conditions = []
+                params = []
+                if user_id is not None:
+                    conditions.append("c.user_id = ?")
+                    params.append(user_id)
+                if cookie_id:
+                    conditions.append("l.cookie_id = ?")
+                    params.append(cookie_id)
+                where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+                params.extend([max(1, min(int(limit or 100), 500)), max(0, int(offset or 0))])
+                cursor.execute(f'''
+                SELECT l.id, l.batch_id, l.cookie_id, l.order_id, l.item_id, l.buyer_id,
+                       l.buyer_nick, l.status, l.message, l.raw_response, l.created_at
+                FROM scheduled_red_flower_logs l
+                LEFT JOIN cookies c ON c.id = l.cookie_id
+                {where_sql}
+                ORDER BY l.created_at DESC, l.id DESC
+                LIMIT ? OFFSET ?
+                ''', params)
+                logs = []
+                for row in cursor.fetchall():
+                    logs.append({
+                        'id': row[0],
+                        'batch_id': row[1],
+                        'cookie_id': row[2],
+                        'order_id': row[3],
+                        'item_id': row[4],
+                        'buyer_id': row[5],
+                        'buyer_nick': row[6],
+                        'status': row[7],
+                        'message': row[8],
+                        'raw_response': row[9],
+                        'created_at': row[10],
+                    })
+                return logs
+            except Exception as e:
+                logger.error(f"查询求小红花日志失败: {e}")
+                return []
+
+    def add_scheduled_task_log(self, batch_id: str = None, task_type: str = 'other_task',
+                               cookie_id: str = None, object_id: str = None,
+                               order_id: str = None, item_id: str = None,
+                               buyer_id: str = None, buyer_nick: str = None,
+                               status: str = 'failed', message: str = None,
+                               raw_response: Any = None) -> Optional[int]:
+        """写入通用任务执行日志。"""
+        safe_task_type = str(task_type or 'other_task').strip() or 'other_task'
+        safe_batch_id = str(batch_id or f"{safe_task_type}_{int(time.time() * 1000)}")
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if raw_response is None:
+                    raw_text = None
+                elif isinstance(raw_response, str):
+                    raw_text = raw_response
+                else:
+                    raw_text = json.dumps(raw_response, ensure_ascii=False, default=str)
+                cursor.execute('''
+                INSERT INTO scheduled_task_logs (
+                    batch_id, task_type, cookie_id, object_id, order_id, item_id,
+                    buyer_id, buyer_nick, status, message, raw_response
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    safe_batch_id, safe_task_type, cookie_id, object_id, order_id, item_id,
+                    buyer_id, buyer_nick, status, message, raw_text
+                ))
+                log_id = cursor.lastrowid
+                self.conn.commit()
+                return log_id
+            except Exception as e:
+                logger.error(f"写入通用任务日志失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def get_scheduled_task_logs(self, user_id: int = None, cookie_id: str = None,
+                                task_type: str = None, limit: int = 100,
+                                offset: int = 0) -> List[Dict]:
+        """查询通用任务日志。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                conditions = []
+                params = []
+                if user_id is not None:
+                    conditions.append("c.user_id = ?")
+                    params.append(user_id)
+                if cookie_id:
+                    conditions.append("l.cookie_id = ?")
+                    params.append(cookie_id)
+                if task_type and task_type != 'all':
+                    conditions.append("l.task_type = ?")
+                    params.append(task_type)
+                where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+                params.extend([max(1, min(int(limit or 100), 500)), max(0, int(offset or 0))])
+                cursor.execute(f'''
+                SELECT l.id, l.batch_id, l.task_type, l.cookie_id, l.object_id,
+                       l.order_id, l.item_id, l.buyer_id, l.buyer_nick,
+                       l.status, l.message, l.raw_response, l.created_at
+                FROM scheduled_task_logs l
+                LEFT JOIN cookies c ON c.id = l.cookie_id
+                {where_sql}
+                ORDER BY l.created_at DESC, l.id DESC
+                LIMIT ? OFFSET ?
+                ''', params)
+                logs = []
+                for row in cursor.fetchall():
+                    logs.append({
+                        'id': row[0],
+                        'batch_id': row[1],
+                        'task_type': row[2],
+                        'cookie_id': row[3],
+                        'object_id': row[4],
+                        'order_id': row[5],
+                        'item_id': row[6],
+                        'buyer_id': row[7],
+                        'buyer_nick': row[8],
+                        'status': row[9],
+                        'message': row[10],
+                        'raw_response': row[11],
+                        'created_at': row[12],
+                    })
+                return logs
+            except Exception as e:
+                logger.error(f"查询通用任务日志失败: {e}")
+                return []
+
+    def get_pending_red_flower_orders(self, cookie_id: str, limit: int = 5,
+                                      days: int = 10, cooldown_minutes: int = 30) -> List[Dict]:
+        """获取待自动求小红花订单。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT o.order_id, o.item_id, o.buyer_id, o.buyer_nick, o.sid,
+                       o.order_status, o.cookie_id, o.platform_completed_at, o.created_at, o.updated_at,
+                       o.is_red_flower, o.red_flower_at, o.red_flower_error
+                FROM orders o
+                WHERE o.cookie_id = ?
+                  AND o.order_status NOT IN ('cancelled', 'processing', 'pending_payment')
+                  AND COALESCE(o.is_red_flower, 0) = 0
+                  AND datetime(COALESCE(o.platform_created_at, o.platform_paid_at, o.created_at)) >= datetime('now', ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM scheduled_red_flower_logs l
+                      WHERE l.order_id = o.order_id
+                        AND l.status IN ('failed', 'cookie_expired')
+                        AND datetime(l.created_at) >= datetime('now', ?)
+                  )
+                ORDER BY datetime(COALESCE(o.platform_created_at, o.platform_paid_at, o.created_at)) ASC
+                LIMIT ?
+                ''', (cookie_id, f'-{max(1, int(days or 10))} days', f'-{max(1, int(cooldown_minutes or 30))} minutes', max(1, min(int(limit or 5), 50))))
+                orders = []
+                for row in cursor.fetchall():
+                    buyer_nick = self._sanitize_order_buyer_nick(row[3])
+                    if not buyer_nick:
+                        buyer_nick = self._lookup_buyer_nick_from_chat_messages(cookie_id, row[4], row[2])
+                    orders.append({
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'buyer_nick': buyer_nick,
+                        'sid': row[4],
+                        'order_status': row[5],
+                        'cookie_id': row[6],
+                        'platform_completed_at': row[7],
+                        'created_at': row[8],
+                        'updated_at': row[9],
+                        'is_red_flower': bool(row[10]),
+                        'red_flower_at': row[11],
+                        'red_flower_error': row[12],
+                    })
+                return orders
+            except Exception as e:
+                logger.error(f"查询待求小红花订单失败: cookie_id={cookie_id}, error={e}")
                 return []
 
     def delete_order(self, order_id: str, cookie_id: str = None) -> bool:
@@ -9224,6 +9942,408 @@ Cookie数量: {cookie_count}
                 self.conn.rollback()
                 return False
 
+    # ==================== 商品发布素材与日志 ====================
+
+    @staticmethod
+    def _json_dumps_safe(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            return str(value)
+
+    @staticmethod
+    def _json_loads_safe(value: Any, default: Any = None) -> Any:
+        if value in (None, ''):
+            return default
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+
+    def add_product_material(self, user_id: int, data: Dict[str, Any]) -> Optional[int]:
+        """新增商品发布素材。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                images_text = self._json_dumps_safe(data.get('images') or [])
+                cursor.execute('''
+                    INSERT INTO product_materials (
+                        user_id, title, description, price, original_price, category, images,
+                        delivery_method, postage, can_self_pickup, brand, condition, remark
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id,
+                    str(data.get('title') or '').strip(),
+                    str(data.get('description') or '').strip(),
+                    data.get('price'),
+                    data.get('original_price'),
+                    data.get('category'),
+                    images_text,
+                    data.get('delivery_method') or '包邮',
+                    data.get('postage') or 0,
+                    1 if data.get('can_self_pickup') else 0,
+                    data.get('brand'),
+                    data.get('condition') or '全新',
+                    data.get('remark'),
+                ))
+                material_id = cursor.lastrowid
+                self.conn.commit()
+                return material_id
+            except Exception as e:
+                logger.error(f"新增商品发布素材失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def _row_to_product_material(self, row) -> Dict[str, Any]:
+        return {
+            'id': row[0],
+            'user_id': row[1],
+            'title': row[2],
+            'description': row[3],
+            'price': row[4],
+            'original_price': row[5],
+            'category': row[6],
+            'images': self._json_loads_safe(row[7], []),
+            'delivery_method': row[8],
+            'postage': row[9],
+            'can_self_pickup': bool(row[10]),
+            'brand': row[11],
+            'condition': row[12],
+            'remark': row[13],
+            'created_at': row[14],
+            'updated_at': row[15],
+        }
+
+    def get_product_material(self, material_id: int, user_id: int = None) -> Optional[Dict[str, Any]]:
+        """获取单条商品发布素材。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                params = [material_id]
+                sql = '''
+                    SELECT id, user_id, title, description, price, original_price, category, images,
+                           delivery_method, postage, can_self_pickup, brand, condition, remark,
+                           created_at, updated_at
+                    FROM product_materials
+                    WHERE id = ?
+                '''
+                if user_id is not None:
+                    sql += ' AND user_id = ?'
+                    params.append(user_id)
+                cursor.execute(sql, tuple(params))
+                row = cursor.fetchone()
+                return self._row_to_product_material(row) if row else None
+            except Exception as e:
+                logger.error(f"获取商品发布素材失败: {e}")
+                return None
+
+    def list_product_materials(self, user_id: int = None, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """分页查询商品发布素材。"""
+        with self.lock:
+            try:
+                safe_page = max(1, int(page or 1))
+                safe_page_size = max(1, min(int(page_size or 20), 100))
+                offset = (safe_page - 1) * safe_page_size
+                cursor = self.conn.cursor()
+                conditions = []
+                params = []
+                if user_id is not None:
+                    conditions.append('user_id = ?')
+                    params.append(user_id)
+                where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ''
+                cursor.execute(f"SELECT COUNT(*) FROM product_materials {where_sql}", tuple(params))
+                total = int(cursor.fetchone()[0] or 0)
+                cursor.execute(f'''
+                    SELECT id, user_id, title, description, price, original_price, category, images,
+                           delivery_method, postage, can_self_pickup, brand, condition, remark,
+                           created_at, updated_at
+                    FROM product_materials
+                    {where_sql}
+                    ORDER BY datetime(created_at) DESC, id DESC
+                    LIMIT ? OFFSET ?
+                ''', tuple(params + [safe_page_size, offset]))
+                rows = [self._row_to_product_material(row) for row in cursor.fetchall()]
+                return {
+                    'list': rows,
+                    'total': total,
+                    'page': safe_page,
+                    'page_size': safe_page_size,
+                    'total_pages': (total + safe_page_size - 1) // safe_page_size if total else 0,
+                }
+            except Exception as e:
+                logger.error(f"查询商品发布素材失败: {e}")
+                return {'list': [], 'total': 0, 'page': page, 'page_size': page_size, 'total_pages': 0}
+
+    def list_product_materials_by_ids(self, material_ids: List[int], user_id: int = None) -> List[Dict[str, Any]]:
+        """按ID列表查询素材。"""
+        ids = []
+        for material_id in material_ids or []:
+            try:
+                mid = int(material_id)
+            except Exception:
+                continue
+            if mid not in ids:
+                ids.append(mid)
+        if not ids:
+            return []
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                placeholders = ','.join(['?'] * len(ids))
+                params: List[Any] = list(ids)
+                sql = f'''
+                    SELECT id, user_id, title, description, price, original_price, category, images,
+                           delivery_method, postage, can_self_pickup, brand, condition, remark,
+                           created_at, updated_at
+                    FROM product_materials
+                    WHERE id IN ({placeholders})
+                '''
+                if user_id is not None:
+                    sql += ' AND user_id = ?'
+                    params.append(user_id)
+                cursor.execute(sql, tuple(params))
+                material_map = {row[0]: self._row_to_product_material(row) for row in cursor.fetchall()}
+                return [material_map[mid] for mid in ids if mid in material_map]
+            except Exception as e:
+                logger.error(f"按ID查询商品发布素材失败: {e}")
+                return []
+
+    def update_product_material(self, material_id: int, user_id: int, data: Dict[str, Any]) -> bool:
+        """更新商品发布素材。"""
+        allowed_fields = {
+            'title', 'description', 'price', 'original_price', 'category', 'images',
+            'delivery_method', 'postage', 'can_self_pickup', 'brand', 'condition', 'remark'
+        }
+        update_fields = []
+        params = []
+        for key, value in (data or {}).items():
+            if key not in allowed_fields:
+                continue
+            if key == 'images':
+                value = self._json_dumps_safe(value or [])
+            elif key == 'can_self_pickup':
+                value = 1 if value else 0
+            update_fields.append(f"{key} = ?")
+            params.append(value)
+        if not update_fields:
+            return False
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                update_fields.append('updated_at = CURRENT_TIMESTAMP')
+                params.extend([material_id, user_id])
+                cursor.execute(
+                    f"UPDATE product_materials SET {', '.join(update_fields)} WHERE id = ? AND user_id = ?",
+                    tuple(params),
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新商品发布素材失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def delete_product_material(self, material_id: int, user_id: int) -> bool:
+        """删除商品发布素材。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("DELETE FROM product_materials WHERE id = ? AND user_id = ?", (material_id, user_id))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"删除商品发布素材失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def add_publish_log(self, user_id: int, account_id: str, title: str, description: str = None,
+                        price: str = None, material_id: int = None, batch_id: str = None,
+                        status: str = 'pending', error_message: str = None,
+                        raw_response: Any = None) -> Optional[int]:
+        """创建商品发布日志。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT INTO publish_logs (
+                        user_id, account_id, title, description, price, material_id,
+                        batch_id, status, error_message, raw_response
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id, account_id, title, description, price, material_id, batch_id,
+                    status, str(error_message)[:1000] if error_message else None,
+                    self._json_dumps_safe(raw_response),
+                ))
+                log_id = cursor.lastrowid
+                self.conn.commit()
+                return log_id
+            except Exception as e:
+                logger.error(f"创建商品发布日志失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def update_publish_log(self, log_id: int, status: str = None, item_url: str = None,
+                           item_id: str = None, error_message: str = None,
+                           sync_status: str = None, sync_message: str = None,
+                           sync_total_count: int = None, sync_saved_count: int = None,
+                           raw_response: Any = None) -> bool:
+        """更新商品发布日志。"""
+        update_fields = []
+        params = []
+        for key, value in {
+            'status': status,
+            'item_url': item_url,
+            'item_id': item_id,
+            'error_message': str(error_message)[:1000] if error_message is not None else None,
+            'sync_status': sync_status,
+            'sync_message': sync_message,
+            'sync_total_count': sync_total_count,
+            'sync_saved_count': sync_saved_count,
+            'raw_response': self._json_dumps_safe(raw_response) if raw_response is not None else None,
+        }.items():
+            if value is not None:
+                update_fields.append(f"{key} = ?")
+                params.append(value)
+        if not update_fields:
+            return False
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                update_fields.append('updated_at = CURRENT_TIMESTAMP')
+                params.append(log_id)
+                cursor.execute(f"UPDATE publish_logs SET {', '.join(update_fields)} WHERE id = ?", tuple(params))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新商品发布日志失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def _row_to_publish_log(self, row) -> Dict[str, Any]:
+        return {
+            'id': row[0],
+            'user_id': row[1],
+            'account_id': row[2],
+            'title': row[3],
+            'description': row[4],
+            'price': row[5],
+            'material_id': row[6],
+            'batch_id': row[7],
+            'status': row[8],
+            'item_url': row[9],
+            'item_id': row[10],
+            'error_message': row[11],
+            'sync_status': row[12],
+            'sync_message': row[13],
+            'sync_total_count': row[14],
+            'sync_saved_count': row[15],
+            'raw_response': self._json_loads_safe(row[16], row[16]),
+            'created_at': row[17],
+            'updated_at': row[18],
+        }
+
+    def list_publish_logs(self, user_id: int = None, account_id: str = None, status: str = None,
+                          batch_id: str = None, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """分页查询商品发布日志。"""
+        with self.lock:
+            try:
+                safe_page = max(1, int(page or 1))
+                safe_page_size = max(1, min(int(page_size or 20), 100))
+                offset = (safe_page - 1) * safe_page_size
+                conditions = []
+                params = []
+                if user_id is not None:
+                    conditions.append('user_id = ?')
+                    params.append(user_id)
+                if account_id:
+                    conditions.append('account_id = ?')
+                    params.append(account_id)
+                if status:
+                    conditions.append('status = ?')
+                    params.append(status)
+                if batch_id:
+                    conditions.append('batch_id = ?')
+                    params.append(batch_id)
+                where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ''
+                cursor = self.conn.cursor()
+                cursor.execute(f"SELECT COUNT(*) FROM publish_logs {where_sql}", tuple(params))
+                total = int(cursor.fetchone()[0] or 0)
+                cursor.execute(f'''
+                    SELECT id, user_id, account_id, title, description, price, material_id, batch_id,
+                           status, item_url, item_id, error_message, sync_status, sync_message,
+                           sync_total_count, sync_saved_count, raw_response, created_at, updated_at
+                    FROM publish_logs
+                    {where_sql}
+                    ORDER BY datetime(created_at) DESC, id DESC
+                    LIMIT ? OFFSET ?
+                ''', tuple(params + [safe_page_size, offset]))
+                logs = [self._row_to_publish_log(row) for row in cursor.fetchall()]
+                return {
+                    'list': logs,
+                    'total': total,
+                    'page': safe_page,
+                    'page_size': safe_page_size,
+                    'total_pages': (total + safe_page_size - 1) // safe_page_size if total else 0,
+                }
+            except Exception as e:
+                logger.error(f"查询商品发布日志失败: {e}")
+                return {'list': [], 'total': 0, 'page': page, 'page_size': page_size, 'total_pages': 0}
+
+    def get_publish_batch_status(self, batch_id: str, user_id: int) -> Dict[str, Any]:
+        """查询批量发布状态。"""
+        logs_data = self.list_publish_logs(user_id=user_id, batch_id=batch_id, page=1, page_size=100)
+        logs = logs_data.get('list') or []
+        counts = {'success': 0, 'failed': 0, 'publishing': 0, 'pending': 0}
+        account_map: Dict[str, Dict[str, int]] = {}
+        for log in logs:
+            status = log.get('status') or 'pending'
+            counts[status] = counts.get(status, 0) + 1
+            account_id = log.get('account_id') or ''
+            account_counts = account_map.setdefault(account_id, {'success': 0, 'failed': 0, 'publishing': 0, 'pending': 0, 'total': 0})
+            account_counts[status] = account_counts.get(status, 0) + 1
+            account_counts['total'] += 1
+        total = len(logs)
+        return {
+            'batch_id': batch_id,
+            'total': total,
+            'success': counts.get('success', 0),
+            'failed': counts.get('failed', 0),
+            'publishing': counts.get('publishing', 0),
+            'pending': counts.get('pending', 0),
+            'finished': total > 0 and (counts.get('publishing', 0) + counts.get('pending', 0)) == 0,
+            'account_statuses': [
+                {
+                    'account_id': account_id,
+                    **status_map,
+                }
+                for account_id, status_map in account_map.items()
+            ],
+            'logs': logs,
+        }
+
+    def clear_old_publish_logs(self, user_id: int, days: int = 30) -> int:
+        """清理指定用户N天前的发布日志。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    DELETE FROM publish_logs
+                    WHERE user_id = ? AND datetime(created_at) < datetime('now', ?)
+                ''', (user_id, f'-{max(1, int(days or 30))} days'))
+                deleted = cursor.rowcount
+                self.conn.commit()
+                return deleted
+            except Exception as e:
+                logger.error(f"清理商品发布日志失败: {e}")
+                self.conn.rollback()
+                return 0
+
     # ==================== 聊天消息 ====================
 
     def save_chat_message(self, cookie_id: str, chat_id: str, sender_id: str,
@@ -9488,6 +10608,607 @@ Cookie数量: {cookie_count}
                 return [dict(zip(columns, row)) for row in rows]
             except Exception as e:
                 logger.error(f"获取全量会话列表失败: {e}")
+                return []
+
+    def _normalize_blacklist_scope_value(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _normalize_blacklist_buyer_ids(self, buyer_ids: Any) -> List[str]:
+        if buyer_ids is None:
+            return []
+        if isinstance(buyer_ids, str):
+            raw_values = re.split(r'[\n,，]+', buyer_ids)
+        else:
+            raw_values = list(buyer_ids)
+
+        normalized = []
+        seen = set()
+        for raw_value in raw_values:
+            buyer_id = str(raw_value or '').strip()
+            if not buyer_id or buyer_id in seen:
+                continue
+            normalized.append(buyer_id)
+            seen.add(buyer_id)
+        return normalized
+
+    def _personal_blacklist_row_to_dict(self, row: tuple, columns: List[str]) -> Dict[str, Any]:
+        record = dict(zip(columns, row))
+        record['is_enabled'] = bool(record.get('is_enabled'))
+        scope = 'user'
+        if self._normalize_blacklist_scope_value(record.get('item_id')):
+            scope = 'item'
+        elif self._normalize_blacklist_scope_value(record.get('cookie_id')):
+            scope = 'account'
+        record['scope'] = scope
+        return record
+
+    def create_personal_blacklist(
+        self,
+        user_id: int,
+        buyer_ids: List[str],
+        cookie_id: str = None,
+        item_id: str = None,
+        reason: str = "",
+        is_enabled: bool = True,
+        buyer_nick: str = "",
+    ) -> Dict[str, Any]:
+        """创建个人黑名单记录，重复 scope 会跳过。"""
+        normalized_buyer_ids = self._normalize_blacklist_buyer_ids(buyer_ids)
+        normalized_cookie_id = self._normalize_blacklist_scope_value(cookie_id)
+        normalized_item_id = self._normalize_blacklist_scope_value(item_id)
+        normalized_reason = str(reason or '').strip()
+        normalized_buyer_nick = str(buyer_nick or '').strip()
+
+        result = {
+            'created': 0,
+            'skipped': 0,
+            'records': [],
+            'skipped_buyer_ids': [],
+        }
+        if not user_id or not normalized_buyer_ids:
+            return result
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                if normalized_cookie_id:
+                    self._execute_sql(cursor, "SELECT user_id FROM cookies WHERE id = ?", (normalized_cookie_id,))
+                    cookie_owner = cursor.fetchone()
+                    if not cookie_owner or int(cookie_owner[0]) != int(user_id):
+                        result['skipped'] = len(normalized_buyer_ids)
+                        result['skipped_buyer_ids'] = normalized_buyer_ids
+                        return result
+
+                for buyer_id in normalized_buyer_ids:
+                    self._execute_sql(cursor, """
+                        SELECT id FROM xy_personal_blacklist
+                        WHERE user_id = ?
+                          AND buyer_id = ?
+                          AND COALESCE(cookie_id, '') = ?
+                          AND COALESCE(item_id, '') = ?
+                        LIMIT 1
+                    """, (
+                        user_id,
+                        buyer_id,
+                        normalized_cookie_id or '',
+                        normalized_item_id or '',
+                    ))
+                    if cursor.fetchone():
+                        result['skipped'] += 1
+                        result['skipped_buyer_ids'].append(buyer_id)
+                        continue
+
+                    self._execute_sql(cursor, """
+                        INSERT INTO xy_personal_blacklist
+                            (user_id, cookie_id, buyer_id, buyer_nick, item_id, reason, is_enabled, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (
+                        user_id,
+                        normalized_cookie_id,
+                        buyer_id,
+                        normalized_buyer_nick,
+                        normalized_item_id,
+                        normalized_reason,
+                        1 if is_enabled else 0,
+                    ))
+                    record_id = cursor.lastrowid
+                    self._execute_sql(cursor, """
+                        SELECT * FROM xy_personal_blacklist WHERE id = ?
+                    """, (record_id,))
+                    columns = [desc[0] for desc in cursor.description]
+                    row = cursor.fetchone()
+                    if row:
+                        result['records'].append(self._personal_blacklist_row_to_dict(row, columns))
+                    result['created'] += 1
+
+                self.conn.commit()
+                return result
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"创建个人黑名单失败: {e}")
+                return result
+
+    def list_personal_blacklist(
+        self,
+        user_id: int,
+        buyer_id: str = None,
+        buyer_nick: str = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Dict[str, Any]:
+        """分页查询个人黑名单。"""
+        safe_page = max(int(page or 1), 1)
+        safe_page_size = min(max(int(page_size or 20), 1), 200)
+        offset = (safe_page - 1) * safe_page_size
+        where_clauses = ["user_id = ?"]
+        params: List[Any] = [user_id]
+
+        normalized_buyer_id = self._normalize_blacklist_scope_value(buyer_id)
+        if normalized_buyer_id:
+            where_clauses.append("buyer_id LIKE ?")
+            params.append(f"%{normalized_buyer_id}%")
+
+        normalized_buyer_nick = self._normalize_blacklist_scope_value(buyer_nick)
+        if normalized_buyer_nick:
+            where_clauses.append("buyer_nick LIKE ?")
+            params.append(f"%{normalized_buyer_nick}%")
+
+        where_sql = " AND ".join(where_clauses)
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(cursor, f"SELECT COUNT(*) FROM xy_personal_blacklist WHERE {where_sql}", tuple(params))
+                total = int(cursor.fetchone()[0] or 0)
+
+                self._execute_sql(cursor, f"""
+                    SELECT * FROM xy_personal_blacklist
+                    WHERE {where_sql}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                """, tuple(params + [safe_page_size, offset]))
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                data = [self._personal_blacklist_row_to_dict(row, columns) for row in rows]
+                return {
+                    'data': data,
+                    'total': total,
+                    'page': safe_page,
+                    'page_size': safe_page_size,
+                }
+            except Exception as e:
+                logger.error(f"查询个人黑名单失败: {e}")
+                return {'data': [], 'total': 0, 'page': safe_page, 'page_size': safe_page_size}
+
+    def delete_personal_blacklist(self, record_id: int, user_id: int) -> bool:
+        """删除单条个人黑名单。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(cursor, "DELETE FROM xy_personal_blacklist WHERE id = ? AND user_id = ?", (record_id, user_id))
+                deleted = cursor.rowcount > 0
+                self.conn.commit()
+                return deleted
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"删除个人黑名单失败: {e}")
+                return False
+
+    def batch_delete_personal_blacklist(self, ids: List[int], user_id: int) -> int:
+        """批量删除个人黑名单，返回删除数量。"""
+        safe_ids = []
+        for raw_id in ids or []:
+            try:
+                record_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if record_id > 0 and record_id not in safe_ids:
+                safe_ids.append(record_id)
+
+        if not safe_ids:
+            return 0
+
+        placeholders = ','.join(['?'] * len(safe_ids))
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(
+                    cursor,
+                    f"DELETE FROM xy_personal_blacklist WHERE user_id = ? AND id IN ({placeholders})",
+                    tuple([user_id] + safe_ids),
+                )
+                deleted = cursor.rowcount
+                self.conn.commit()
+                return deleted
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"批量删除个人黑名单失败: {e}")
+                return 0
+
+    def toggle_personal_blacklist(self, record_id: int, user_id: int, is_enabled: bool) -> bool:
+        """启用或禁用个人黑名单。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(cursor, """
+                    UPDATE xy_personal_blacklist
+                    SET is_enabled = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                """, (1 if is_enabled else 0, record_id, user_id))
+                updated = cursor.rowcount > 0
+                self.conn.commit()
+                return updated
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"更新个人黑名单状态失败: {e}")
+                return False
+
+    def is_buyer_blacklisted(
+        self,
+        user_id: int,
+        buyer_id: str,
+        cookie_id: str = None,
+        item_id: str = None,
+    ) -> Optional[Dict[str, Any]]:
+        """按商品级 > 账号级 > 用户级匹配个人黑名单。"""
+        normalized_buyer_id = self._normalize_blacklist_scope_value(buyer_id)
+        if not user_id or not normalized_buyer_id:
+            return None
+
+        normalized_cookie_id = self._normalize_blacklist_scope_value(cookie_id)
+        normalized_item_id = self._normalize_blacklist_scope_value(item_id)
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(cursor, """
+                    SELECT * FROM xy_personal_blacklist
+                    WHERE user_id = ?
+                      AND buyer_id = ?
+                      AND is_enabled = 1
+                      AND (
+                        (COALESCE(cookie_id, '') = '' AND COALESCE(item_id, '') = '')
+                        OR (COALESCE(cookie_id, '') = ? AND COALESCE(item_id, '') = '')
+                        OR (COALESCE(item_id, '') = ? AND (COALESCE(cookie_id, '') = '' OR COALESCE(cookie_id, '') = ?))
+                      )
+                    ORDER BY
+                      CASE
+                        WHEN COALESCE(item_id, '') != '' THEN 3
+                        WHEN COALESCE(cookie_id, '') != '' THEN 2
+                        ELSE 1
+                      END DESC,
+                      updated_at DESC,
+                      id DESC
+                    LIMIT 1
+                """, (
+                    user_id,
+                    normalized_buyer_id,
+                    normalized_cookie_id or '',
+                    normalized_item_id or '',
+                    normalized_cookie_id or '',
+                ))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                columns = [desc[0] for desc in cursor.description]
+                return self._personal_blacklist_row_to_dict(row, columns)
+            except Exception as e:
+                logger.error(f"匹配个人黑名单失败: {e}")
+                return None
+
+    def list_platform_blacklist(self, user_id: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """分页查询平台黑名单（当前仅预留展示）。"""
+        safe_page = max(int(page or 1), 1)
+        safe_page_size = min(max(int(page_size or 20), 1), 200)
+        offset = (safe_page - 1) * safe_page_size
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(cursor, "SELECT COUNT(*) FROM xy_platform_blacklist WHERE user_id = ?", (user_id,))
+                total = int(cursor.fetchone()[0] or 0)
+                self._execute_sql(cursor, """
+                    SELECT id, user_id, buyer_id, buyer_nick, created_at, updated_at
+                    FROM xy_platform_blacklist
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                """, (user_id, safe_page_size, offset))
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                return {
+                    'data': [dict(zip(columns, row)) for row in rows],
+                    'total': total,
+                    'page': safe_page,
+                    'page_size': safe_page_size,
+                }
+            except Exception as e:
+                logger.error(f"查询平台黑名单失败: {e}")
+                return {'data': [], 'total': 0, 'page': safe_page, 'page_size': safe_page_size}
+
+    def _message_filter_row_to_dict(self, row: tuple, columns: List[str]) -> Dict[str, Any]:
+        record = dict(zip(columns, row))
+        for field_name in ['is_enabled', 'action_skip_auto_reply', 'action_skip_ai_reply', 'action_notify']:
+            record[field_name] = bool(record.get(field_name))
+        try:
+            patterns = json.loads(record.get('patterns') or '[]')
+        except Exception:
+            patterns = []
+        if not isinstance(patterns, list):
+            patterns = []
+        record['patterns'] = [str(pattern or '').strip() for pattern in patterns if str(pattern or '').strip()]
+        record['patterns_text'] = '\n'.join(record['patterns'])
+        scope = 'user'
+        if self._normalize_blacklist_scope_value(record.get('item_id')):
+            scope = 'item'
+        elif self._normalize_blacklist_scope_value(record.get('cookie_id')):
+            scope = 'account'
+        record['scope'] = scope
+        try:
+            record['action_pause_minutes'] = max(0, int(record.get('action_pause_minutes') or 0))
+        except (TypeError, ValueError):
+            record['action_pause_minutes'] = 0
+        return record
+
+    def _ensure_message_filter_cookie_owner(self, cookie_id: Optional[str], user_id: int) -> bool:
+        normalized_cookie_id = self._normalize_blacklist_scope_value(cookie_id)
+        if not normalized_cookie_id:
+            return True
+        cursor = self.conn.cursor()
+        self._execute_sql(cursor, "SELECT user_id FROM cookies WHERE id = ?", (normalized_cookie_id,))
+        row = cursor.fetchone()
+        return bool(row and int(row[0]) == int(user_id))
+
+    def create_message_filter_rule(
+        self,
+        user_id: int,
+        name: str,
+        patterns: str,
+        cookie_id: str = None,
+        item_id: str = None,
+        match_type: str = 'contains',
+        message_source: str = 'user',
+        is_enabled: bool = True,
+        action_skip_auto_reply: bool = True,
+        action_skip_ai_reply: bool = False,
+        action_pause_minutes: int = 0,
+        action_notify: bool = False,
+    ) -> Dict[str, Any]:
+        """创建消息过滤规则。"""
+        normalized_cookie_id = self._normalize_blacklist_scope_value(cookie_id)
+        normalized_item_id = self._normalize_blacklist_scope_value(item_id)
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                if not self._ensure_message_filter_cookie_owner(normalized_cookie_id, user_id):
+                    raise ValueError('无权限操作该账号')
+                self._execute_sql(cursor, """
+                    INSERT INTO xy_message_filter_rules
+                        (user_id, cookie_id, item_id, name, match_type, patterns, message_source,
+                         is_enabled, action_skip_auto_reply, action_skip_ai_reply,
+                         action_pause_minutes, action_notify, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (
+                    user_id,
+                    normalized_cookie_id,
+                    normalized_item_id,
+                    str(name or '').strip(),
+                    str(match_type or 'contains').strip(),
+                    patterns,
+                    str(message_source or 'user').strip(),
+                    1 if is_enabled else 0,
+                    1 if action_skip_auto_reply else 0,
+                    1 if action_skip_ai_reply else 0,
+                    max(0, int(action_pause_minutes or 0)),
+                    1 if action_notify else 0,
+                ))
+                record_id = cursor.lastrowid
+                self._execute_sql(cursor, "SELECT * FROM xy_message_filter_rules WHERE id = ? AND user_id = ?", (record_id, user_id))
+                row = cursor.fetchone()
+                columns = [desc[0] for desc in cursor.description]
+                record = self._message_filter_row_to_dict(row, columns) if row else {}
+                self.conn.commit()
+                return record
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"创建消息过滤规则失败: {e}")
+                raise
+
+    def update_message_filter_rule(
+        self,
+        rule_id: int,
+        user_id: int,
+        name: str,
+        patterns: str,
+        cookie_id: str = None,
+        item_id: str = None,
+        match_type: str = 'contains',
+        message_source: str = 'user',
+        is_enabled: bool = True,
+        action_skip_auto_reply: bool = True,
+        action_skip_ai_reply: bool = False,
+        action_pause_minutes: int = 0,
+        action_notify: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """更新消息过滤规则。"""
+        normalized_cookie_id = self._normalize_blacklist_scope_value(cookie_id)
+        normalized_item_id = self._normalize_blacklist_scope_value(item_id)
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                if not self._ensure_message_filter_cookie_owner(normalized_cookie_id, user_id):
+                    raise ValueError('无权限操作该账号')
+                self._execute_sql(cursor, """
+                    UPDATE xy_message_filter_rules
+                    SET cookie_id = ?, item_id = ?, name = ?, match_type = ?, patterns = ?,
+                        message_source = ?, is_enabled = ?, action_skip_auto_reply = ?,
+                        action_skip_ai_reply = ?, action_pause_minutes = ?, action_notify = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                """, (
+                    normalized_cookie_id,
+                    normalized_item_id,
+                    str(name or '').strip(),
+                    str(match_type or 'contains').strip(),
+                    patterns,
+                    str(message_source or 'user').strip(),
+                    1 if is_enabled else 0,
+                    1 if action_skip_auto_reply else 0,
+                    1 if action_skip_ai_reply else 0,
+                    max(0, int(action_pause_minutes or 0)),
+                    1 if action_notify else 0,
+                    rule_id,
+                    user_id,
+                ))
+                if cursor.rowcount <= 0:
+                    self.conn.rollback()
+                    return None
+                self._execute_sql(cursor, "SELECT * FROM xy_message_filter_rules WHERE id = ? AND user_id = ?", (rule_id, user_id))
+                row = cursor.fetchone()
+                columns = [desc[0] for desc in cursor.description]
+                record = self._message_filter_row_to_dict(row, columns) if row else None
+                self.conn.commit()
+                return record
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"更新消息过滤规则失败: {e}")
+                raise
+
+    def get_message_filter_rule(self, rule_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        """按 ID 查询消息过滤规则。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(cursor, "SELECT * FROM xy_message_filter_rules WHERE id = ? AND user_id = ?", (rule_id, user_id))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                columns = [desc[0] for desc in cursor.description]
+                return self._message_filter_row_to_dict(row, columns)
+            except Exception as e:
+                logger.error(f"查询消息过滤规则失败: {e}")
+                return None
+
+    def list_message_filter_rules(
+        self,
+        user_id: int,
+        keyword: str = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Dict[str, Any]:
+        """分页查询消息过滤规则。"""
+        safe_page = max(int(page or 1), 1)
+        safe_page_size = min(max(int(page_size or 20), 1), 200)
+        offset = (safe_page - 1) * safe_page_size
+        where_clauses = ["user_id = ?"]
+        params: List[Any] = [user_id]
+        normalized_keyword = self._normalize_blacklist_scope_value(keyword)
+        if normalized_keyword:
+            where_clauses.append("(name LIKE ? OR patterns LIKE ? OR item_id LIKE ? OR cookie_id LIKE ?)")
+            like_value = f"%{normalized_keyword}%"
+            params.extend([like_value, like_value, like_value, like_value])
+        where_sql = " AND ".join(where_clauses)
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(cursor, f"SELECT COUNT(*) FROM xy_message_filter_rules WHERE {where_sql}", tuple(params))
+                total = int(cursor.fetchone()[0] or 0)
+                self._execute_sql(cursor, f"""
+                    SELECT * FROM xy_message_filter_rules
+                    WHERE {where_sql}
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                """, tuple(params + [safe_page_size, offset]))
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                return {
+                    'data': [self._message_filter_row_to_dict(row, columns) for row in rows],
+                    'total': total,
+                    'page': safe_page,
+                    'page_size': safe_page_size,
+                }
+            except Exception as e:
+                logger.error(f"查询消息过滤规则列表失败: {e}")
+                return {'data': [], 'total': 0, 'page': safe_page, 'page_size': safe_page_size}
+
+    def delete_message_filter_rule(self, rule_id: int, user_id: int) -> bool:
+        """删除消息过滤规则。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(cursor, "DELETE FROM xy_message_filter_rules WHERE id = ? AND user_id = ?", (rule_id, user_id))
+                deleted = cursor.rowcount > 0
+                self.conn.commit()
+                return deleted
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"删除消息过滤规则失败: {e}")
+                return False
+
+    def toggle_message_filter_rule(self, rule_id: int, user_id: int, is_enabled: bool) -> bool:
+        """启用或禁用消息过滤规则。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(cursor, """
+                    UPDATE xy_message_filter_rules
+                    SET is_enabled = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                """, (1 if is_enabled else 0, rule_id, user_id))
+                updated = cursor.rowcount > 0
+                self.conn.commit()
+                return updated
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"更新消息过滤规则状态失败: {e}")
+                return False
+
+    def get_message_filter_rules_for_context(
+        self,
+        user_id: int,
+        cookie_id: str = None,
+        item_id: str = None,
+    ) -> List[Dict[str, Any]]:
+        """按用户/账号/商品上下文读取启用的过滤规则。"""
+        normalized_cookie_id = self._normalize_blacklist_scope_value(cookie_id) or ''
+        normalized_item_id = self._normalize_blacklist_scope_value(item_id) or ''
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(cursor, """
+                    SELECT * FROM xy_message_filter_rules
+                    WHERE user_id = ?
+                      AND is_enabled = 1
+                      AND (
+                        (COALESCE(cookie_id, '') = '' AND COALESCE(item_id, '') = '')
+                        OR (? != '' AND COALESCE(cookie_id, '') = ? AND COALESCE(item_id, '') = '')
+                        OR (? != '' AND COALESCE(item_id, '') = ? AND (COALESCE(cookie_id, '') = '' OR COALESCE(cookie_id, '') = ?))
+                      )
+                    ORDER BY
+                      CASE
+                        WHEN COALESCE(item_id, '') != '' THEN 3
+                        WHEN COALESCE(cookie_id, '') != '' THEN 2
+                        ELSE 1
+                      END DESC,
+                      updated_at DESC,
+                      id DESC
+                """, (
+                    user_id,
+                    normalized_cookie_id,
+                    normalized_cookie_id,
+                    normalized_item_id,
+                    normalized_item_id,
+                    normalized_cookie_id,
+                ))
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                return [self._message_filter_row_to_dict(row, columns) for row in rows]
+            except Exception as e:
+                logger.error(f"查询上下文消息过滤规则失败: {e}")
                 return []
 
 

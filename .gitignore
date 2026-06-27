@@ -289,13 +289,18 @@ build/
 *.dmg
 *.img
 
-# 文档文件（除了README.md）
+# 文档文件（除了README.md和少量公开文档）
 *.md
 !README.md
 !CHANGELOG.md
 !CONTRIBUTING.md
 !SECURITY.md
 !LICENSE.md
+!docs/deployment.md
+!docs/configuration.md
+!docs/usage.md
+!docs/faq.md
+!docs/release.md
 
 # 临时配置文件
 *.local.yml
@@ -352,7 +357,7 @@ stats.log
 # 加密相关文件（保留项目核心文件，只忽略临时解密文件）
 # *_decrypted.py  # 注释掉，因为项目中有重要的解密文件
 # *_ultra.py      # 注释掉，因为项目中有重要的ultra文件
-item_polish_module.py
+secure_item_polish_ultra.py
 
 # 临时脚本文件
 temp_*.py

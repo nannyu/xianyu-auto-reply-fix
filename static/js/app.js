@@ -40,6 +40,11 @@ let currentSearchKeyword = ''; // 当前搜索关键词
 let itemPublishPreviewUrls = [];
 let itemPublishInitialized = false;
 let itemPublishSubmitting = false;
+let itemPublishSavingMaterial = false;
+let itemPublishLoadedMaterialId = null;
+let itemPublishLoadedMaterialImages = [];
+let itemPublishMaterials = [];
+let itemPublishLogs = [];
 
 // 订单列表搜索和分页相关变量
 let allOrdersData = []; // 存储所有订单数据
@@ -52,11 +57,25 @@ let ordersStreamAbortController = null;
 let ordersStreamReconnectTimer = null;
 let ordersStreamRetryCount = 0;
 let ordersStreamShouldRun = false;
+let pendingOrderLocator = null;
 let orderHistorySyncModalInstance = null;
 let orderHistorySyncPollingTimer = null;
 let activeOrderHistorySyncJobId = '';
 let orderHistorySyncNotifiedJobId = '';
 let orderHistorySyncAccounts = [];
+let blacklistState = {
+    page: 1,
+    pageSize: 20,
+    total: 0,
+    accountsLoaded: false
+};
+let messageFilterState = {
+    page: 1,
+    pageSize: 20,
+    total: 0,
+    accountsLoaded: false,
+    editingId: null
+};
 let loadingRequestCount = 0;
 let loadingShowTimer = null;
 const LOADING_SHOW_DELAY = 120;
@@ -122,6 +141,9 @@ function showSection(sectionName) {
     case 'auto-reply':      // 【自动回复菜单】
         refreshAccountList();
         break;
+    case 'message-filters': // 【消息过滤菜单】
+        loadMessageFiltersPage();
+        break;
     case 'cards':           // 【卡券管理菜单】
         loadCards();
         break;
@@ -166,6 +188,9 @@ function showSection(sectionName) {
         break;
     case 'online-im':        // 【在线客服菜单】
         loadOnlineIm();
+        break;
+    case 'blacklist':        // 【黑名单管理菜单】
+        loadBlacklistPage();
         break;
     case 'data-management':  // 【数据管理菜单】
         loadDataManagement();
@@ -3371,8 +3396,765 @@ async function fetchJSON(url, opts = {}) {
 }
 
 // ================================
-// 账号保活诊断
+// 【消息过滤菜单】相关功能
 // ================================
+
+async function loadMessageFiltersPage() {
+    await loadMessageFilterAccountOptions();
+    await loadMessageFilters(messageFilterState.page || 1);
+}
+
+async function loadMessageFilterAccountOptions(force = false) {
+    const accountSelect = document.getElementById('messageFilterCookieId');
+    if (!accountSelect) return;
+    if (messageFilterState.accountsLoaded && !force) return;
+
+    try {
+        const currentValue = accountSelect.value;
+        const accounts = await fetchJSON(`${apiBase}/cookies/details`);
+        const safeAccounts = Array.isArray(accounts) ? accounts : [];
+        accountSelect.innerHTML = '<option value="">全部账号</option>' + safeAccounts.map(account => {
+            const accountId = String(account.id || '').trim();
+            const remark = String(account.remark || '').trim();
+            const label = remark ? `${accountId}（${remark}）` : accountId;
+            return `<option value="${escapeHtml(accountId)}">${escapeHtml(label)}</option>`;
+        }).join('');
+        if (currentValue && safeAccounts.some(account => String(account.id || '') === currentValue)) {
+            accountSelect.value = currentValue;
+        }
+        messageFilterState.accountsLoaded = true;
+    } catch (error) {
+        console.error('加载消息过滤账号选项失败:', error);
+    }
+}
+
+function handleMessageFilterKeydown(event) {
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        loadMessageFilters(1);
+    }
+}
+
+async function loadMessageFilters(page = 1) {
+    const tableBody = document.getElementById('messageFilterTableBody');
+    if (!tableBody) return;
+
+    const pageSizeSelect = document.getElementById('messageFilterPageSize');
+    const pageSize = Math.max(1, parseInt(pageSizeSelect?.value || '20', 10) || 20);
+    const safePage = Math.max(1, parseInt(page, 10) || 1);
+    const params = new URLSearchParams({
+        page: String(safePage),
+        page_size: String(pageSize)
+    });
+    const keyword = document.getElementById('messageFilterKeyword')?.value?.trim();
+    if (keyword) params.set('keyword', keyword);
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/message-filters?${params.toString()}`);
+        const records = Array.isArray(result?.data) ? result.data : [];
+        messageFilterState.page = Number(result?.page || safePage);
+        messageFilterState.pageSize = Number(result?.page_size || pageSize);
+        messageFilterState.total = Number(result?.total || 0);
+        renderMessageFilters(records);
+        renderMessageFilterPagination();
+    } catch (error) {
+        console.error('加载消息过滤规则失败:', error);
+        tableBody.innerHTML = `
+            <tr>
+                <td colspan="7" class="text-center py-4 text-danger">
+                    <i class="bi bi-exclamation-triangle fs-1 d-block mb-3"></i>
+                    加载消息过滤规则失败
+                </td>
+            </tr>
+        `;
+    }
+}
+
+function getMessageFilterScopeBadge(scope) {
+    const normalizedScope = String(scope || 'user');
+    const config = {
+        item: { text: '商品级', cls: 'bg-warning text-dark' },
+        account: { text: '账号级', cls: 'bg-info text-dark' },
+        user: { text: '用户级', cls: 'bg-secondary' }
+    }[normalizedScope] || { text: normalizedScope || '未知', cls: 'bg-secondary' };
+    return `<span class="badge ${config.cls}">${escapeHtml(config.text)}</span>`;
+}
+
+function getMessageFilterMatchTypeLabel(matchType) {
+    return ({
+        contains: '包含',
+        exact: '完全',
+        regex: '正则'
+    }[String(matchType || 'contains')] || '包含');
+}
+
+function getMessageFilterSourceLabel(source) {
+    return ({
+        user: '客户',
+        system: '系统',
+        all: '全部'
+    }[String(source || 'user')] || '客户');
+}
+
+function getMessageFilterActionsHtml(record) {
+    const actions = [];
+    if (record?.action_skip_auto_reply) actions.push('跳过自动回复');
+    if (record?.action_skip_ai_reply) actions.push('跳过AI');
+    const pauseMinutes = Number(record?.action_pause_minutes || 0);
+    if (pauseMinutes > 0) actions.push(`暂停${pauseMinutes}分钟`);
+    if (record?.action_notify) actions.push('通知人工');
+    if (actions.length === 0) return '<span class="text-muted small">仅记录</span>';
+    return actions.map(action => `<span class="badge bg-light text-dark border me-1 mb-1">${escapeHtml(action)}</span>`).join('');
+}
+
+function renderMessageFilters(records) {
+    const tableBody = document.getElementById('messageFilterTableBody');
+    const totalText = document.getElementById('messageFilterTotalText');
+    if (!tableBody) return;
+
+    if (totalText) {
+        totalText.textContent = `共 ${messageFilterState.total || 0} 条`;
+    }
+
+    if (!Array.isArray(records) || records.length === 0) {
+        tableBody.innerHTML = `
+            <tr>
+                <td colspan="7" class="text-center py-4 text-muted">
+                    <i class="bi bi-funnel fs-1 d-block mb-3"></i>
+                    暂无过滤规则
+                </td>
+            </tr>
+        `;
+        return;
+    }
+
+    tableBody.innerHTML = records.map(record => {
+        const ruleId = Number(record.id || 0);
+        const name = String(record.name || '').trim();
+        const patterns = Array.isArray(record.patterns) ? record.patterns : [];
+        const patternPreview = patterns.slice(0, 3).join(' / ');
+        const cookieId = String(record.cookie_id || '').trim();
+        const itemId = String(record.item_id || '').trim();
+        const enabled = Boolean(record.is_enabled);
+        const updatedAt = formatDateTime(record.updated_at || record.created_at || '');
+        const targetParts = [];
+        targetParts.push(cookieId ? `账号 ${cookieId}` : '全部账号');
+        if (itemId) targetParts.push(`商品 ${itemId}`);
+        const encodedRecord = encodeURIComponent(JSON.stringify(record));
+        return `
+            <tr>
+                <td>
+                    ${getMessageFilterScopeBadge(record.scope)}
+                    <div class="small text-muted mt-1">${targetParts.map(part => escapeHtml(part)).join('<br>')}</div>
+                </td>
+                <td>
+                    <div class="fw-semibold" title="${escapeHtml(name)}">${escapeHtml(name || '-')}</div>
+                    <div class="small text-muted">${getMessageFilterSourceLabel(record.message_source)}消息</div>
+                </td>
+                <td style="max-width: 220px;">
+                    <div class="small"><span class="badge bg-light text-dark border">${getMessageFilterMatchTypeLabel(record.match_type)}</span></div>
+                    <div class="text-truncate mt-1" title="${escapeHtml(patterns.join('\n'))}">${escapeHtml(patternPreview || '-')}</div>
+                </td>
+                <td style="max-width: 260px;">${getMessageFilterActionsHtml(record)}</td>
+                <td>
+                    <div class="form-check form-switch m-0" title="${enabled ? '点击禁用' : '点击启用'}">
+                        <input class="form-check-input" type="checkbox" ${enabled ? 'checked' : ''} onchange="toggleMessageFilter(${ruleId}, this.checked)">
+                    </div>
+                </td>
+                <td><small class="text-muted text-nowrap">${escapeHtml(updatedAt)}</small></td>
+                <td>
+                    <div class="btn-group btn-group-sm" role="group">
+                        <button type="button" class="btn btn-outline-primary" onclick="editMessageFilterRule('${encodedRecord}')" title="编辑">
+                            <i class="bi bi-pencil"></i>
+                        </button>
+                        <button type="button" class="btn btn-outline-danger" onclick="deleteMessageFilter(${ruleId})" title="删除">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </div>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function renderMessageFilterPagination() {
+    const pagination = document.getElementById('messageFilterPagination');
+    const pageText = document.getElementById('messageFilterPageText');
+    if (!pagination) return;
+
+    const pageSize = Math.max(1, Number(messageFilterState.pageSize || 20));
+    const total = Math.max(0, Number(messageFilterState.total || 0));
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const currentPage = Math.min(Math.max(1, Number(messageFilterState.page || 1)), totalPages);
+
+    if (currentPage !== messageFilterState.page && total > 0) {
+        loadMessageFilters(currentPage);
+        return;
+    }
+
+    if (pageText) {
+        pageText.textContent = `第 ${currentPage} / ${totalPages} 页`;
+    }
+
+    const startPage = Math.max(1, currentPage - 2);
+    const endPage = Math.min(totalPages, startPage + 4);
+    const buttons = [];
+    const addButton = (label, targetPage, disabled = false, active = false, title = '') => {
+        buttons.push(`
+            <button type="button" class="btn btn-sm ${active ? 'btn-primary' : 'btn-outline-secondary'}" ${disabled ? 'disabled' : ''} onclick="loadMessageFilters(${targetPage})" title="${escapeHtml(title || label)}">
+                ${label}
+            </button>
+        `);
+    };
+
+    addButton('<i class="bi bi-chevron-left"></i>', currentPage - 1, currentPage <= 1, false, '上一页');
+    for (let page = startPage; page <= endPage; page += 1) {
+        addButton(String(page), page, false, page === currentPage);
+    }
+    addButton('<i class="bi bi-chevron-right"></i>', currentPage + 1, currentPage >= totalPages, false, '下一页');
+    pagination.innerHTML = buttons.join('');
+}
+
+function getMessageFilterPayload() {
+    const name = document.getElementById('messageFilterName')?.value?.trim() || '';
+    const patterns = document.getElementById('messageFilterPatterns')?.value?.trim() || '';
+    if (!name) {
+        showToast('请填写规则名称', 'warning');
+        return null;
+    }
+    if (!patterns) {
+        showToast('请填写匹配内容', 'warning');
+        return null;
+    }
+    const pauseMinutes = Math.max(0, parseInt(document.getElementById('messageFilterPauseMinutes')?.value || '0', 10) || 0);
+    return {
+        name,
+        cookie_id: document.getElementById('messageFilterCookieId')?.value?.trim() || null,
+        item_id: document.getElementById('messageFilterItemId')?.value?.trim() || null,
+        match_type: document.getElementById('messageFilterMatchType')?.value || 'contains',
+        message_source: document.getElementById('messageFilterSource')?.value || 'user',
+        patterns,
+        is_enabled: Boolean(document.getElementById('messageFilterEnabled')?.checked),
+        action_skip_auto_reply: Boolean(document.getElementById('messageFilterSkipAutoReply')?.checked),
+        action_skip_ai_reply: Boolean(document.getElementById('messageFilterSkipAiReply')?.checked),
+        action_pause_minutes: Math.min(pauseMinutes, 1440),
+        action_notify: Boolean(document.getElementById('messageFilterNotify')?.checked)
+    };
+}
+
+async function saveMessageFilterRule() {
+    const payload = getMessageFilterPayload();
+    if (!payload) return;
+
+    const editingId = Number(messageFilterState.editingId || 0);
+    const url = editingId > 0
+        ? `${apiBase}/api/message-filters/${editingId}`
+        : `${apiBase}/api/message-filters`;
+    const method = editingId > 0 ? 'PUT' : 'POST';
+
+    try {
+        const result = await fetchJSON(url, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        showToast(result?.message || '消息过滤规则已保存', 'success');
+        resetMessageFilterForm();
+        await loadMessageFilters(editingId > 0 ? (messageFilterState.page || 1) : 1);
+    } catch (error) {
+        console.error('保存消息过滤规则失败:', error);
+    }
+}
+
+function editMessageFilterRule(encodedRecord) {
+    try {
+        const record = JSON.parse(decodeURIComponent(encodedRecord));
+        messageFilterState.editingId = Number(record.id || 0);
+        const formTitle = document.getElementById('messageFilterFormTitle');
+        if (formTitle) formTitle.textContent = '编辑过滤规则';
+        const fields = {
+            messageFilterRuleId: record.id || '',
+            messageFilterName: record.name || '',
+            messageFilterCookieId: record.cookie_id || '',
+            messageFilterItemId: record.item_id || '',
+            messageFilterMatchType: record.match_type || 'contains',
+            messageFilterSource: record.message_source || 'user',
+            messageFilterPatterns: Array.isArray(record.patterns) ? record.patterns.join('\n') : (record.patterns_text || ''),
+            messageFilterPauseMinutes: record.action_pause_minutes || 0
+        };
+        Object.entries(fields).forEach(([id, value]) => {
+            const element = document.getElementById(id);
+            if (element) element.value = value;
+        });
+        const checks = {
+            messageFilterEnabled: record.is_enabled,
+            messageFilterSkipAutoReply: record.action_skip_auto_reply,
+            messageFilterSkipAiReply: record.action_skip_ai_reply,
+            messageFilterNotify: record.action_notify
+        };
+        Object.entries(checks).forEach(([id, checked]) => {
+            const element = document.getElementById(id);
+            if (element) element.checked = Boolean(checked);
+        });
+        document.getElementById('messageFilterName')?.focus();
+    } catch (error) {
+        console.error('编辑消息过滤规则失败:', error);
+        showToast('加载规则失败', 'danger');
+    }
+}
+
+function resetMessageFilterForm() {
+    const form = document.getElementById('messageFilterForm');
+    if (form) form.reset();
+    messageFilterState.editingId = null;
+    const ruleId = document.getElementById('messageFilterRuleId');
+    if (ruleId) ruleId.value = '';
+    const formTitle = document.getElementById('messageFilterFormTitle');
+    if (formTitle) formTitle.textContent = '新增过滤规则';
+    const enabled = document.getElementById('messageFilterEnabled');
+    const skipAuto = document.getElementById('messageFilterSkipAutoReply');
+    const skipAi = document.getElementById('messageFilterSkipAiReply');
+    const notify = document.getElementById('messageFilterNotify');
+    const pause = document.getElementById('messageFilterPauseMinutes');
+    const matchType = document.getElementById('messageFilterMatchType');
+    const source = document.getElementById('messageFilterSource');
+    if (enabled) enabled.checked = true;
+    if (skipAuto) skipAuto.checked = true;
+    if (skipAi) skipAi.checked = false;
+    if (notify) notify.checked = false;
+    if (pause) pause.value = '0';
+    if (matchType) matchType.value = 'contains';
+    if (source) source.value = 'user';
+}
+
+async function toggleMessageFilter(ruleId, isEnabled) {
+    try {
+        await fetchJSON(`${apiBase}/api/message-filters/${ruleId}/toggle`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ is_enabled: Boolean(isEnabled) })
+        });
+        showToast(isEnabled ? '规则已启用' : '规则已禁用', 'success');
+    } catch (error) {
+        console.error('更新消息过滤规则状态失败:', error);
+        await loadMessageFilters(messageFilterState.page || 1);
+    }
+}
+
+async function deleteMessageFilter(ruleId) {
+    if (!confirm('确定删除这条消息过滤规则吗？')) return;
+    try {
+        const result = await fetchJSON(`${apiBase}/api/message-filters/${ruleId}`, {
+            method: 'DELETE'
+        });
+        showToast(result?.message || '消息过滤规则已删除', 'success');
+        if (Number(messageFilterState.editingId || 0) === Number(ruleId || 0)) {
+            resetMessageFilterForm();
+        }
+        await loadMessageFilters(messageFilterState.page || 1);
+    } catch (error) {
+        console.error('删除消息过滤规则失败:', error);
+    }
+}
+
+function resetMessageFilterSearch() {
+    const keyword = document.getElementById('messageFilterKeyword');
+    if (keyword) keyword.value = '';
+    loadMessageFilters(1);
+}
+
+// ================================
+// 【黑名单管理菜单】相关功能
+// ================================
+
+async function loadBlacklistPage() {
+    await loadBlacklistAccountOptions();
+    await loadPersonalBlacklist(blacklistState.page || 1);
+}
+
+async function loadBlacklistAccountOptions(force = false) {
+    const accountSelect = document.getElementById('blacklistCookieId');
+    if (!accountSelect) return;
+    if (blacklistState.accountsLoaded && !force) return;
+
+    try {
+        const currentValue = accountSelect.value;
+        const accounts = await fetchJSON(`${apiBase}/cookies/details`);
+        const safeAccounts = Array.isArray(accounts) ? accounts : [];
+        accountSelect.innerHTML = '<option value="">全部账号</option>' + safeAccounts.map(account => {
+            const accountId = String(account.id || '').trim();
+            const remark = String(account.remark || '').trim();
+            const label = remark ? `${accountId}（${remark}）` : accountId;
+            return `<option value="${escapeHtml(accountId)}">${escapeHtml(label)}</option>`;
+        }).join('');
+        if (currentValue && safeAccounts.some(account => String(account.id || '') === currentValue)) {
+            accountSelect.value = currentValue;
+        }
+        blacklistState.accountsLoaded = true;
+    } catch (error) {
+        console.error('加载黑名单账号选项失败:', error);
+    }
+}
+
+function handleBlacklistFilterKeydown(event) {
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        loadPersonalBlacklist(1);
+    }
+}
+
+async function loadPersonalBlacklist(page = 1) {
+    const tableBody = document.getElementById('blacklistTableBody');
+    if (!tableBody) return;
+
+    const pageSizeSelect = document.getElementById('blacklistPageSize');
+    const pageSize = Math.max(1, parseInt(pageSizeSelect?.value || '20', 10) || 20);
+    const safePage = Math.max(1, parseInt(page, 10) || 1);
+    const params = new URLSearchParams({
+        page: String(safePage),
+        page_size: String(pageSize)
+    });
+
+    const buyerId = document.getElementById('blacklistFilterBuyerId')?.value?.trim();
+    const buyerNick = document.getElementById('blacklistFilterBuyerNick')?.value?.trim();
+    if (buyerId) params.set('buyer_id', buyerId);
+    if (buyerNick) params.set('buyer_nick', buyerNick);
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/blacklist/personal?${params.toString()}`);
+        const records = Array.isArray(result?.data) ? result.data : [];
+        blacklistState.page = Number(result?.page || safePage);
+        blacklistState.pageSize = Number(result?.page_size || pageSize);
+        blacklistState.total = Number(result?.total || 0);
+        renderPersonalBlacklist(records);
+        renderBlacklistPagination();
+    } catch (error) {
+        console.error('加载个人黑名单失败:', error);
+        tableBody.innerHTML = `
+            <tr>
+                <td colspan="8" class="text-center py-4 text-danger">
+                    <i class="bi bi-exclamation-triangle fs-1 d-block mb-3"></i>
+                    加载黑名单失败
+                </td>
+            </tr>
+        `;
+    }
+}
+
+function getBlacklistScopeBadge(scope) {
+    const normalizedScope = String(scope || 'user');
+    const config = {
+        item: { text: '商品级', cls: 'bg-warning text-dark' },
+        account: { text: '账号级', cls: 'bg-info text-dark' },
+        user: { text: '用户级', cls: 'bg-secondary' }
+    }[normalizedScope] || { text: normalizedScope || '未知', cls: 'bg-secondary' };
+    return `<span class="badge ${config.cls}">${escapeHtml(config.text)}</span>`;
+}
+
+function getBlacklistTargetHtml(record) {
+    const cookieId = String(record?.cookie_id || '').trim();
+    const itemId = String(record?.item_id || '').trim();
+    const parts = [];
+    parts.push(cookieId ? `账号 ${cookieId}` : '全部账号');
+    if (itemId) parts.push(`商品 ${itemId}`);
+    return parts.map(part => `<div class="small text-muted text-nowrap" title="${escapeHtml(part)}">${escapeHtml(part)}</div>`).join('');
+}
+
+function renderPersonalBlacklist(records) {
+    const tableBody = document.getElementById('blacklistTableBody');
+    const totalText = document.getElementById('blacklistTotalText');
+    const selectAll = document.getElementById('blacklistSelectAll');
+    if (!tableBody) return;
+
+    if (totalText) {
+        totalText.textContent = `共 ${blacklistState.total || 0} 条`;
+    }
+    if (selectAll) {
+        selectAll.checked = false;
+        selectAll.indeterminate = false;
+    }
+
+    if (!Array.isArray(records) || records.length === 0) {
+        tableBody.innerHTML = `
+            <tr>
+                <td colspan="8" class="text-center py-4 text-muted">
+                    <i class="bi bi-person-x fs-1 d-block mb-3"></i>
+                    暂无黑名单记录
+                </td>
+            </tr>
+        `;
+        updateBlacklistBatchDeleteState();
+        return;
+    }
+
+    tableBody.innerHTML = records.map(record => {
+        const recordId = Number(record.id || 0);
+        const buyerId = String(record.buyer_id || '').trim();
+        const buyerNick = String(record.buyer_nick || '').trim();
+        const reason = String(record.reason || '').trim();
+        const enabled = Boolean(record.is_enabled);
+        const createdAt = formatDateTime(record.created_at || record.updated_at || '');
+        return `
+            <tr>
+                <td>
+                    <input class="form-check-input blacklist-row-check" type="checkbox" data-id="${recordId}" onchange="updateBlacklistBatchDeleteState()">
+                </td>
+                <td>${getBlacklistScopeBadge(record.scope)}</td>
+                <td>
+                    <div class="fw-semibold" title="${escapeHtml(buyerId)}">${escapeHtml(buyerId)}</div>
+                    ${buyerNick ? `<div class="small text-muted" title="${escapeHtml(buyerNick)}">${escapeHtml(buyerNick)}</div>` : ''}
+                </td>
+                <td>${getBlacklistTargetHtml(record)}</td>
+                <td style="max-width: 220px;">
+                    <span class="d-inline-block text-truncate" style="max-width: 100%;" title="${escapeHtml(reason)}">${escapeHtml(reason || '-')}</span>
+                </td>
+                <td>
+                    <div class="form-check form-switch m-0" title="${enabled ? '点击禁用' : '点击启用'}">
+                        <input class="form-check-input" type="checkbox" ${enabled ? 'checked' : ''} onchange="togglePersonalBlacklist(${recordId}, this.checked)">
+                    </div>
+                </td>
+                <td><small class="text-muted text-nowrap">${escapeHtml(createdAt)}</small></td>
+                <td>
+                    <button type="button" class="btn btn-outline-danger btn-sm" onclick="deletePersonalBlacklist(${recordId})" title="删除">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </td>
+            </tr>
+        `;
+    }).join('');
+    updateBlacklistBatchDeleteState();
+}
+
+function renderBlacklistPagination() {
+    const pagination = document.getElementById('blacklistPagination');
+    const pageText = document.getElementById('blacklistPageText');
+    if (!pagination) return;
+
+    const pageSize = Math.max(1, Number(blacklistState.pageSize || 20));
+    const total = Math.max(0, Number(blacklistState.total || 0));
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const currentPage = Math.min(Math.max(1, Number(blacklistState.page || 1)), totalPages);
+
+    if (currentPage !== blacklistState.page && total > 0) {
+        loadPersonalBlacklist(currentPage);
+        return;
+    }
+
+    if (pageText) {
+        pageText.textContent = `第 ${currentPage} / ${totalPages} 页`;
+    }
+
+    const startPage = Math.max(1, currentPage - 2);
+    const endPage = Math.min(totalPages, startPage + 4);
+    const buttons = [];
+    const addButton = (label, targetPage, disabled = false, active = false, title = '') => {
+        buttons.push(`
+            <button type="button" class="btn btn-sm ${active ? 'btn-primary' : 'btn-outline-secondary'}" ${disabled ? 'disabled' : ''} onclick="loadPersonalBlacklist(${targetPage})" title="${escapeHtml(title || label)}">
+                ${label}
+            </button>
+        `);
+    };
+
+    addButton('<i class="bi bi-chevron-left"></i>', currentPage - 1, currentPage <= 1, false, '上一页');
+    for (let page = startPage; page <= endPage; page += 1) {
+        addButton(String(page), page, false, page === currentPage);
+    }
+    addButton('<i class="bi bi-chevron-right"></i>', currentPage + 1, currentPage >= totalPages, false, '下一页');
+    pagination.innerHTML = buttons.join('');
+}
+
+async function createPersonalBlacklist() {
+    const buyerIds = document.getElementById('blacklistBuyerIds')?.value?.trim() || '';
+    if (!buyerIds) {
+        showToast('请填写买家ID', 'warning');
+        return;
+    }
+
+    const payload = {
+        buyer_ids: buyerIds,
+        cookie_id: document.getElementById('blacklistCookieId')?.value?.trim() || null,
+        item_id: document.getElementById('blacklistItemId')?.value?.trim() || null,
+        buyer_nick: document.getElementById('blacklistBuyerNick')?.value?.trim() || '',
+        reason: document.getElementById('blacklistReason')?.value?.trim() || '',
+        is_enabled: Boolean(document.getElementById('blacklistEnabled')?.checked)
+    };
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/blacklist/personal`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        showToast(result?.message || '黑名单已保存', 'success');
+        resetPersonalBlacklistForm();
+        await loadPersonalBlacklist(1);
+    } catch (error) {
+        console.error('新增个人黑名单失败:', error);
+    }
+}
+
+function resetPersonalBlacklistForm() {
+    const form = document.getElementById('personalBlacklistForm');
+    if (form) form.reset();
+    const enabled = document.getElementById('blacklistEnabled');
+    if (enabled) enabled.checked = true;
+}
+
+async function togglePersonalBlacklist(recordId, isEnabled) {
+    try {
+        await fetchJSON(`${apiBase}/api/blacklist/personal/${recordId}/toggle`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ is_enabled: Boolean(isEnabled) })
+        });
+        showToast(isEnabled ? '黑名单已启用' : '黑名单已禁用', 'success');
+    } catch (error) {
+        console.error('更新黑名单状态失败:', error);
+        await loadPersonalBlacklist(blacklistState.page || 1);
+    }
+}
+
+async function deletePersonalBlacklist(recordId) {
+    if (!confirm('确定删除这条黑名单记录吗？')) return;
+    try {
+        const result = await fetchJSON(`${apiBase}/api/blacklist/personal/${recordId}`, {
+            method: 'DELETE'
+        });
+        showToast(result?.message || '黑名单已删除', 'success');
+        await loadPersonalBlacklist(blacklistState.page || 1);
+    } catch (error) {
+        console.error('删除个人黑名单失败:', error);
+    }
+}
+
+function getSelectedBlacklistIds() {
+    return Array.from(document.querySelectorAll('.blacklist-row-check:checked'))
+        .map(checkbox => parseInt(checkbox.dataset.id || '0', 10))
+        .filter(id => id > 0);
+}
+
+function toggleBlacklistSelectAll(checked) {
+    document.querySelectorAll('.blacklist-row-check').forEach(checkbox => {
+        checkbox.checked = Boolean(checked);
+    });
+    updateBlacklistBatchDeleteState();
+}
+
+function updateBlacklistBatchDeleteState() {
+    const selectedIds = getSelectedBlacklistIds();
+    const batchButton = document.getElementById('blacklistBatchDeleteBtn');
+    const selectAll = document.getElementById('blacklistSelectAll');
+    const rowChecks = Array.from(document.querySelectorAll('.blacklist-row-check'));
+
+    if (batchButton) {
+        batchButton.disabled = selectedIds.length === 0;
+        batchButton.innerHTML = selectedIds.length > 0
+            ? `<i class="bi bi-trash me-1"></i>批量删除 (${selectedIds.length})`
+            : '<i class="bi bi-trash me-1"></i>批量删除';
+    }
+
+    if (selectAll) {
+        selectAll.checked = rowChecks.length > 0 && selectedIds.length === rowChecks.length;
+        selectAll.indeterminate = selectedIds.length > 0 && selectedIds.length < rowChecks.length;
+    }
+}
+
+async function batchDeletePersonalBlacklist() {
+    const selectedIds = getSelectedBlacklistIds();
+    if (selectedIds.length === 0) {
+        showToast('请先选择要删除的黑名单', 'warning');
+        return;
+    }
+    if (!confirm(`确定删除选中的 ${selectedIds.length} 条黑名单记录吗？`)) return;
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/blacklist/personal/batch-delete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: selectedIds })
+        });
+        showToast(result?.message || '批量删除完成', 'success');
+        await loadPersonalBlacklist(blacklistState.page || 1);
+    } catch (error) {
+        console.error('批量删除个人黑名单失败:', error);
+    }
+}
+
+function resetBlacklistFilters() {
+    const buyerId = document.getElementById('blacklistFilterBuyerId');
+    const buyerNick = document.getElementById('blacklistFilterBuyerNick');
+    if (buyerId) buyerId.value = '';
+    if (buyerNick) buyerNick.value = '';
+    loadPersonalBlacklist(1);
+}
+
+async function exportPersonalBlacklist() {
+    toggleLoading(true);
+    try {
+        const response = await fetch(`${apiBase}/api/blacklist/personal/export`, {
+            headers: { 'Authorization': `Bearer ${getAuthToken()}` }
+        });
+        if (response.status === 401) {
+            localStorage.removeItem('auth_token');
+            window.location.href = '/';
+            return;
+        }
+        if (!response.ok) {
+            let message = `导出失败: HTTP ${response.status}`;
+            try {
+                const errorText = await response.text();
+                if (errorText) message = errorText;
+            } catch {}
+            throw new Error(message);
+        }
+        const blob = await response.blob();
+        const disposition = response.headers.get('Content-Disposition') || '';
+        const filenameMatch = disposition.match(/filename="?([^";]+)"?/i);
+        const filename = filenameMatch ? filenameMatch[1] : `personal_blacklist_${Date.now()}.xlsx`;
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        showToast('黑名单已导出', 'success');
+    } catch (error) {
+        console.error('导出个人黑名单失败:', error);
+        showToast(error.message || '导出个人黑名单失败', 'danger');
+    } finally {
+        toggleLoading(false);
+    }
+}
+
+async function importPersonalBlacklistFile() {
+    const input = document.getElementById('blacklistImportFile');
+    const file = input?.files?.[0];
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.xlsx')) {
+        showToast('仅支持 .xlsx 文件', 'warning');
+        input.value = '';
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+        const result = await fetchJSON(`${apiBase}/api/blacklist/personal/import`, {
+            method: 'POST',
+            body: formData
+        });
+        showToast(result?.message || '黑名单导入完成', 'success');
+        await loadPersonalBlacklist(1);
+    } catch (error) {
+        console.error('导入个人黑名单失败:', error);
+    } finally {
+        input.value = '';
+    }
+}
+
+
 
 function getAboutDiagnosticsElements() {
     return {
@@ -4180,6 +4962,9 @@ async function loadCookies() {
         // 自动好评状态（默认关闭）
         const autoComment = cookie.auto_comment === undefined ? false : cookie.auto_comment;
 
+        // 自动求小红花状态（默认关闭）
+        const autoRedFlower = cookie.auto_red_flower === undefined ? false : cookie.auto_red_flower;
+
         tr.innerHTML = `
         <td class="align-middle">
             <div class="cookie-id">
@@ -4197,14 +4982,16 @@ async function loadCookies() {
             </span>
         </td>
         <td class="align-middle">
-            <div class="d-flex align-items-center gap-2 flex-wrap account-status-cell">
-            <label class="status-toggle" title="${isEnabled ? '点击禁用' : '点击启用'}">
-                <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleAccountStatus('${cookie.id}', this.checked)">
-                <span class="status-slider"></span>
-            </label>
-            <span class="status-badge ${isEnabled ? 'enabled' : 'disabled'}" title="${isEnabled ? '账号已启用' : '账号已禁用'}">
-                <i class="bi bi-${isEnabled ? 'check-circle-fill' : 'x-circle-fill'}"></i>
-            </span>
+            <div class="account-status-cell">
+            <div class="account-status-main">
+                <label class="status-toggle" title="${isEnabled ? '点击禁用' : '点击启用'}">
+                    <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleAccountStatus('${cookie.id}', this.checked)">
+                    <span class="status-slider"></span>
+                </label>
+                <span class="status-badge ${isEnabled ? 'enabled' : 'disabled'}" title="${isEnabled ? '账号已启用' : '账号已禁用'}">
+                    <i class="bi bi-${isEnabled ? 'check-circle-fill' : 'x-circle-fill'}"></i>
+                </span>
+            </div>
             ${statusNoteBadge}
             </div>
         </td>
@@ -4253,30 +5040,52 @@ async function loadCookies() {
                 </span>
             </div>
         </td>
-        <td class="align-middle">
-            <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-secondary" onclick="showFaceVerification('${cookie.id}')" title="验证截图">
-                <i class="bi bi-shield-check"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-primary" onclick="editCookieInline('${cookie.id}', '${cookie.value}')" title="修改Cookie" ${!isEnabled ? 'disabled' : ''}>
-                <i class="bi bi-pencil"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-success" onclick="goToAutoReply('${cookie.id}')" title="${isEnabled ? '设置自动回复' : '配置关键词 (账号已禁用)'}">
-                <i class="bi bi-arrow-right-circle"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-warning" onclick="configAIReply('${cookie.id}')" title="配置AI回复" ${!isEnabled ? 'disabled' : ''}>
-                <i class="bi bi-robot"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-secondary" onclick="polishAccountItems('${cookie.id}')" title="一键擦亮" ${!isEnabled ? 'disabled' : ''}>
-                <i class="bi bi-stars"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-info" onclick="openPolishScheduleModal('${cookie.id}')" title="定时擦亮" ${!isEnabled ? 'disabled' : ''}>
-                <i class="bi bi-clock"></i>
-            </button>
-
-            <button class="btn btn-sm btn-outline-danger" onclick="delCookie('${cookie.id}')" title="删除账号">
-                <i class="bi bi-trash"></i>
-            </button>
+        <td class="align-middle account-actions-cell">
+            <div class="account-actions-toolbar" role="group" aria-label="账号操作">
+            <div class="account-action-group account-action-group-basic" aria-label="基础操作">
+                <span class="account-action-group-label">基础</span>
+                <button class="btn btn-sm btn-outline-secondary account-action-btn" onclick="showFaceVerification('${cookie.id}')" title="查看验证截图" data-action="face-verification">
+                    <i class="bi bi-shield-check"></i><span class="action-text">验证</span>
+                </button>
+                <button class="btn btn-sm btn-outline-primary account-action-btn" onclick="editCookieInline('${cookie.id}', '${cookie.value}')" title="修改账号信息与Cookie" data-action="edit-cookie" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
+                    <i class="bi bi-pencil"></i><span class="action-text">编辑</span>
+                </button>
+            </div>
+            <div class="account-action-group account-action-group-reply" aria-label="回复配置">
+                <span class="account-action-group-label">回复</span>
+                <button class="btn btn-sm btn-outline-success account-action-btn" onclick="goToAutoReply('${cookie.id}')" title="${isEnabled ? '设置自动回复' : '配置关键词 (账号已禁用)'}" data-action="auto-reply">
+                    <i class="bi bi-chat-dots"></i><span class="action-text">规则</span>
+                </button>
+                <button class="btn btn-sm btn-outline-warning account-action-btn" onclick="configAIReply('${cookie.id}')" title="配置AI回复" data-action="ai-reply" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
+                    <i class="bi bi-robot"></i><span class="action-text">AI</span>
+                </button>
+                <button class="btn btn-sm btn-outline-danger account-action-btn" onclick="runHistoricalAutoCommentForAccount('${cookie.id}')" title="历史订单补评价" data-action="history-rate" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
+                    <i class="bi bi-star-fill"></i><span class="action-text">补评</span>
+                </button>
+            </div>
+            <div class="account-action-group account-action-group-item" aria-label="商品操作">
+                <span class="account-action-group-label">商品</span>
+                <button class="btn btn-sm btn-outline-secondary account-action-btn" onclick="polishAccountItems('${cookie.id}')" title="立即擦亮全部商品" data-action="polish-items" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
+                    <i class="bi bi-stars"></i><span class="action-text">擦亮</span>
+                </button>
+                <button class="btn btn-sm btn-outline-info account-action-btn" onclick="openPolishScheduleModal('${cookie.id}')" title="设置定时擦亮" data-action="polish-schedule" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
+                    <i class="bi bi-clock"></i><span class="action-text">定时</span>
+                </button>
+            </div>
+            <div class="account-action-group account-action-group-flower" aria-label="小红花操作">
+                <span class="account-action-group-label">小红花</span>
+                <button class="btn btn-sm ${autoRedFlower ? 'btn-outline-danger' : 'btn-outline-secondary'} account-action-btn" onclick="toggleAutoRedFlower('${cookie.id}', ${!autoRedFlower})" title="${autoRedFlower ? '关闭自动求小红花' : '开启自动求小红花'}" data-auto-red-flower-toggle="${cookie.id}" data-auto-red-flower-active="${autoRedFlower ? 'true' : 'false'}">
+                    <i class="bi bi-flower${autoRedFlower ? '1' : '2'}"></i><span class="action-text">${autoRedFlower ? '已开' : '开启'}</span>
+                </button>
+                <button class="btn btn-sm btn-outline-danger account-action-btn" onclick="runAutoRedFlowerForAccount('${cookie.id}')" title="立即执行求小红花" data-red-flower-run="${cookie.id}" data-red-flower-active="${autoRedFlower ? 'true' : 'false'}" ${(!isEnabled || !autoRedFlower) ? 'disabled' : ''}>
+                    <i class="bi bi-send-fill"></i><span class="action-text">执行</span>
+                </button>
+            </div>
+            <div class="account-action-group account-action-group-danger" aria-label="危险操作">
+                <button class="btn btn-sm btn-outline-danger account-action-btn account-action-delete" onclick="delCookie('${cookie.id}')" title="删除账号" data-action="delete-account">
+                    <i class="bi bi-trash"></i><span class="action-text">删除</span>
+                </button>
+            </div>
             </div>
         </td>
         `;
@@ -4727,7 +5536,7 @@ function cancelCookieEdit(id) {
     cookieValueCell.innerHTML = window.editingCookieData.originalContent;
 
     // 恢复按钮状态
-    const actionButtons = row.querySelectorAll('.btn-group button');
+    const actionButtons = row.querySelectorAll('.account-actions-toolbar button, .btn-group button');
     actionButtons.forEach(btn => btn.disabled = false);
 
     // 清理全局数据
@@ -4816,7 +5625,7 @@ function updateAccountRowStatus(accountId, enabled, statusNote = '') {
     const row = toggle.closest('tr');
     const statusBadge = row.querySelector('.status-badge');
     const statusCell = row.querySelector('.account-status-cell');
-    const actionButtons = row.querySelectorAll('.btn-group .btn:not(.btn-outline-info):not(.btn-outline-danger)');
+    const actionButtons = row.querySelectorAll('.account-actions-toolbar .btn[data-requires-enabled="true"], .btn-group .btn:not(.btn-outline-info):not(.btn-outline-danger)');
 
     // 更新行样式
     row.className = `account-row ${enabled ? 'enabled' : 'disabled'}`;
@@ -4837,16 +5646,21 @@ function updateAccountRowStatus(accountId, enabled, statusNote = '') {
         statusCell.insertAdjacentHTML('beforeend', renderedStatusNote);
     }
 
-    // 更新按钮状态（只禁用编辑Cookie按钮，其他按钮保持可用）
+    // 更新依赖账号启用状态的按钮；自动回复规则入口始终可用
     actionButtons.forEach(btn => {
-    if (btn.onclick && btn.onclick.toString().includes('editCookieInline')) {
+    if (btn.dataset.requiresEnabled === 'true') {
         btn.disabled = !enabled;
     }
-    // 设置自动回复按钮始终可用，但更新提示文本
     if (btn.onclick && btn.onclick.toString().includes('goToAutoReply')) {
         btn.title = enabled ? '设置自动回复' : '配置关键词 (账号已禁用)';
     }
     });
+
+    const redFlowerRunButton = row.querySelector('[data-red-flower-run]');
+    if (redFlowerRunButton) {
+        const redFlowerEnabled = redFlowerRunButton.dataset.redFlowerActive === 'true';
+        redFlowerRunButton.disabled = !enabled || !redFlowerEnabled;
+    }
 
     // 更新切换按钮的提示
     const label = toggle.closest('.status-toggle');
@@ -4984,6 +5798,142 @@ function updateAutoCommentRowStatus(accountId, enabled) {
         // 更新切换按钮的提示
         const label = toggle.closest('.status-toggle');
         label.title = enabled ? '点击关闭自动好评' : '点击开启自动好评';
+    }
+}
+
+async function runHistoricalAutoComment(accountIds, options = {}) {
+    const normalizedIds = Array.from(new Set((accountIds || []).map(id => String(id || '').trim()).filter(Boolean)));
+    if (normalizedIds.length === 0) {
+        showToast('当前没有可补评的账号', 'warning');
+        return;
+    }
+
+    const confirmText = options.confirmText || `确定要为 ${normalizedIds.length} 个账号执行历史订单补评价吗？\n\n将从闲鱼待评价列表拉取订单，并按账号激活的好评模板逐单评价。`;
+    if (!options.skipConfirm && !confirm(confirmText)) return;
+
+    toggleLoading(true);
+    showToast('正在执行历史订单补评价，请稍候...', 'info');
+    try {
+        const response = await fetch(`${apiBase}/api/auto-comment/batch-rate`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: JSON.stringify({ cookie_ids: normalizedIds, page_size: 100 })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.success === false) {
+            showToast(data.detail || data.message || '历史补评价失败', 'danger');
+            return;
+        }
+
+        const stats = data.data || {};
+        const failedDetails = (stats.details || []).filter(item => !item.success || (item.failed_count || 0) > 0);
+        const summary = `历史补评完成：评价 ${stats.total_rated || 0} 笔，失败 ${stats.total_failed || 0} 笔，待评 ${stats.total_pending || 0} 笔`;
+        if (failedDetails.length > 0) {
+            const failedText = failedDetails.slice(0, 3).map(item => `${item.account_id}：${item.message}`).join('；');
+            showToast(`${summary}。${failedText}`, 'warning');
+        } else {
+            showToast(data.message || summary, 'success');
+        }
+        await loadCookies();
+    } catch (error) {
+        console.error('历史补评价失败:', error);
+        showToast(`历史补评价请求异常: ${error.message}`, 'danger');
+    } finally {
+        toggleLoading(false);
+    }
+}
+
+// 批量执行当前账号列表的历史订单补评价
+async function runHistoricalAutoCommentForAllAccounts() {
+    const accountIds = Array.from(document.querySelectorAll('#cookieTable tbody .cookie-id strong'))
+        .map(el => (el.textContent || '').trim())
+        .filter(Boolean);
+    await runHistoricalAutoComment(accountIds, {
+        confirmText: `确定要为当前列表中的 ${accountIds.length} 个账号执行历史订单补评价吗？\n\n将从闲鱼待评价列表拉取订单，并按账号激活的好评模板逐单评价。`
+    });
+}
+
+// 执行单个账号的历史订单补评价
+async function runHistoricalAutoCommentForAccount(accountId) {
+    if (!accountId) {
+        showToast('缺少账号ID', 'warning');
+        return;
+    }
+    await runHistoricalAutoComment([accountId], {
+        confirmText: `确定要为账号「${accountId}」执行历史订单补评价吗？`
+    });
+}
+
+// 切换自动求小红花状态
+async function toggleAutoRedFlower(accountId, enabled) {
+    try {
+        toggleLoading(true);
+
+        const response = await fetch(`${apiBase}/cookies/${accountId}/auto-red-flower`, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: JSON.stringify({ auto_red_flower: enabled })
+        });
+
+        if (response.ok) {
+            const result = await response.json();
+            showToast(result.message || (enabled ? '已开启自动求小红花' : '已关闭自动求小红花'), 'success');
+            await loadCookies();
+        } else {
+            const error = await response.json().catch(() => ({}));
+            showToast(error.detail || '更新自动求小红花设置失败', 'error');
+        }
+    } catch (error) {
+        console.error('切换自动求小红花状态失败:', error);
+        showToast('网络错误，请稍后重试', 'error');
+    } finally {
+        toggleLoading(false);
+    }
+}
+
+// 立即执行当前账号的求小红花补偿
+async function runAutoRedFlowerForAccount(accountId) {
+    if (!accountId) {
+        showToast('缺少账号ID', 'warning');
+        return;
+    }
+
+    const confirmed = confirm(`确定要立即为账号「${accountId}」执行一轮求小红花吗？`);
+    if (!confirmed) return;
+
+    toggleLoading(true);
+    showToast('正在执行求小红花，请稍候...', 'info');
+    try {
+        const response = await fetch(`${apiBase}/api/auto-red-flower/run-once`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: JSON.stringify({ cookie_id: accountId })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.success === false) {
+            showToast(data.detail || data.message || '求小红花执行失败', 'danger');
+            return;
+        }
+        const stats = data?.data?.stats || {};
+        showToast(
+            `求小红花完成：处理 ${stats.orders || 0} 单，成功 ${stats.success || 0}，失败 ${stats.failed || 0}，跳过 ${stats.skipped || 0}`,
+            (stats.failed || 0) > 0 ? 'warning' : 'success'
+        );
+        await loadCookies();
+    } catch (error) {
+        console.error('执行求小红花失败:', error);
+        showToast(`求小红花请求异常: ${error.message}`, 'danger');
+    } finally {
+        toggleLoading(false);
     }
 }
 
@@ -9134,12 +10084,14 @@ const DEFAULT_MENU_ITEMS = [
     { id: 'items', name: '商品管理', icon: 'bi-box-seam', required: false },
     { id: 'orders', name: '订单管理', icon: 'bi-receipt-cutoff', required: false },
     { id: 'auto-reply', name: '自动回复', icon: 'bi-chat-left-text', required: false },
+    { id: 'message-filters', name: '消息过滤', icon: 'bi-funnel', required: false },
     { id: 'items-reply', name: '指定商品回复', icon: 'bi-chat-left-text', required: false },
     { id: 'cards', name: '卡券管理', icon: 'bi-credit-card', required: false },
     { id: 'auto-delivery', name: '自动发货', icon: 'bi-truck', required: false },
     { id: 'notification-channels', name: '通知渠道', icon: 'bi-bell', required: false },
     { id: 'message-notifications', name: '消息通知', icon: 'bi-chat-dots', required: false },
     { id: 'online-im', name: '在线客服', icon: 'bi-headset', required: false },
+    { id: 'blacklist', name: '黑名单管理', icon: 'bi-person-x', required: false },
     { id: 'system-settings', name: '系统设置', icon: 'bi-gear', required: true },
     { id: 'about', name: '关于', icon: 'bi-info-circle', required: true }
 ];
@@ -9940,7 +10892,11 @@ async function doRestartSystem() {
 async function loadItemPublish() {
     ensureItemPublishPageInitialized();
     handlePublishDeliveryChoiceChange();
-    await loadItemPublishAccounts();
+    await Promise.all([
+        loadItemPublishAccounts(),
+        loadItemPublishMaterials(),
+        loadItemPublishLogs()
+    ]);
 }
 
 function ensureItemPublishPageInitialized() {
@@ -10046,6 +11002,10 @@ function handlePublishImagesChange() {
     }
 
     const files = Array.from(input.files || []);
+    if (files.length > 0) {
+        itemPublishLoadedMaterialImages = [];
+    }
+    updateItemPublishMaterialModeBadge();
     if (files.length > 9) {
         showToast('单次最多上传 9 张图片', 'warning');
         input.value = '';
@@ -10110,6 +11070,9 @@ function clearItemPublishImagePreviews() {
 
 function clearItemPublishForm(clearResult = true) {
     clearItemPublishImagePreviews();
+    itemPublishLoadedMaterialId = null;
+    itemPublishLoadedMaterialImages = [];
+    updateItemPublishMaterialModeBadge();
     handlePublishDeliveryChoiceChange();
 
     const imagesInput = document.getElementById('publishImages');
@@ -10154,6 +11117,12 @@ function renderItemPublishResult(data, isSuccess) {
     if (data.published_item_id) {
         metaRows.push({ label: '商品ID', value: data.published_item_id });
     }
+    if (data.item_url) {
+        metaRows.push({ label: '商品链接', value: data.item_url });
+    }
+    if (data.log_id) {
+        metaRows.push({ label: '发布日志', value: `#${data.log_id}` });
+    }
 
     const syncResult = data.sync_result || {};
     if (syncResult.message) {
@@ -10195,62 +11164,412 @@ function renderItemPublishResult(data, isSuccess) {
     `).join('');
 }
 
+async function requestItemPublishJson(path, options = {}) {
+    const response = await fetch(`${apiBase}${path}`, {
+        ...options,
+        headers: {
+            'Authorization': `Bearer ${authToken}`,
+            ...(options.headers || {})
+        }
+    });
+    const responseText = await response.text();
+    let responseData = {};
+    try {
+        responseData = responseText ? JSON.parse(responseText) : {};
+    } catch (parseError) {
+        responseData = { detail: responseText || `HTTP ${response.status}` };
+    }
+    if (!response.ok) {
+        throw new Error(responseData.detail || responseData.message || `HTTP ${response.status}`);
+    }
+    return responseData;
+}
+
+function parseOptionalPublishNumber(value, label) {
+    const text = String(value ?? '').trim();
+    if (!text) {
+        return null;
+    }
+    const number = Number(text);
+    if (!Number.isFinite(number) || number < 0) {
+        throw new Error(`${label}必须是大于等于 0 的数字`);
+    }
+    return number;
+}
+
+function getItemPublishFormValues() {
+    return {
+        accountId: document.getElementById('publishCookieId')?.value || '',
+        title: document.getElementById('publishTitle')?.value.trim() || '',
+        description: document.getElementById('publishDescription')?.value.trim() || '',
+        currentPrice: document.getElementById('publishCurrentPrice')?.value.trim() || '',
+        originalPrice: document.getElementById('publishOriginalPrice')?.value.trim() || '',
+        deliveryChoice: document.getElementById('publishDeliveryChoice')?.value || '包邮',
+        postPrice: document.getElementById('publishPostPrice')?.value.trim() || '',
+        canSelfPickup: document.getElementById('publishCanSelfPickup')?.checked || false,
+        files: Array.from(document.getElementById('publishImages')?.files || [])
+    };
+}
+
+function validateItemPublishValues(values, { requireAccount = true, requireImages = true } = {}) {
+    if (requireAccount && !values.accountId) {
+        throw new Error('请选择发布账号');
+    }
+    if (!values.title) {
+        throw new Error('请输入商品标题');
+    }
+    if (!values.description) {
+        throw new Error('请输入商品描述');
+    }
+    if (values.files.length > 9) {
+        throw new Error('单次最多上传 9 张图片');
+    }
+    if (values.originalPrice && !values.currentPrice) {
+        throw new Error('填写原价时必须同时填写现价');
+    }
+    if (values.deliveryChoice === '一口价' && !values.postPrice) {
+        throw new Error('运费方式为一口价时必须填写邮费');
+    }
+    parseOptionalPublishNumber(values.currentPrice, '现价');
+    parseOptionalPublishNumber(values.originalPrice, '原价');
+    parseOptionalPublishNumber(values.postPrice, '邮费');
+
+    const imageCount = values.files.length || itemPublishLoadedMaterialImages.length;
+    if (requireImages && imageCount === 0) {
+        throw new Error('请至少上传 1 张商品图片或载入素材图片');
+    }
+}
+
+function fileToDataUrl(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(new Error(`读取图片失败: ${file.name || '未知图片'}`));
+        reader.readAsDataURL(file);
+    });
+}
+
+async function convertPublishFilesToImages(files) {
+    const images = [];
+    for (const [index, file] of files.entries()) {
+        if (file.type && !file.type.startsWith('image/')) {
+            throw new Error(`第 ${index + 1} 张文件不是图片`);
+        }
+        images.push({
+            filename: file.name || `publish-image-${index + 1}.jpg`,
+            data: await fileToDataUrl(file),
+            size: file.size || 0,
+            type: file.type || 'image/jpeg'
+        });
+    }
+    return images;
+}
+
+function buildItemPublishJsonPayload(values, images) {
+    return {
+        account_id: values.accountId,
+        title: values.title,
+        description: values.description,
+        price: parseOptionalPublishNumber(values.currentPrice, '现价'),
+        original_price: parseOptionalPublishNumber(values.originalPrice, '原价'),
+        images,
+        delivery_method: values.deliveryChoice,
+        postage: parseOptionalPublishNumber(values.postPrice, '邮费'),
+        can_self_pickup: values.canSelfPickup,
+        condition: '全新'
+    };
+}
+
+function buildItemPublishMaterialPayload(values, images) {
+    const payload = buildItemPublishJsonPayload({ ...values, accountId: values.accountId || 'material' }, images);
+    delete payload.account_id;
+    return payload;
+}
+
+function updateItemPublishMaterialModeBadge() {
+    const badge = document.getElementById('publishMaterialModeBadge');
+    if (!badge) {
+        return;
+    }
+    if (itemPublishLoadedMaterialId) {
+        badge.className = 'badge text-bg-info';
+        badge.textContent = `编辑素材 #${itemPublishLoadedMaterialId}`;
+    } else {
+        badge.className = 'badge text-bg-light border';
+        badge.textContent = '新建素材';
+    }
+}
+
+function getItemPublishImageSrc(image) {
+    const raw = String(image?.url || image?.image_url || image?.src || image?.data || image?.base64 || '').trim();
+    if (!raw) {
+        return '';
+    }
+    if (raw.startsWith('data:') || raw.startsWith('http://') || raw.startsWith('https://') || raw.startsWith('/')) {
+        return raw;
+    }
+    return `data:image/jpeg;base64,${raw}`;
+}
+
+function renderItemPublishStoredImagePreviews(images) {
+    const previewContainer = document.getElementById('publishImagePreviewList');
+    const summary = document.getElementById('publishImageSummary');
+    clearItemPublishImagePreviews();
+    if (!previewContainer) {
+        return;
+    }
+    const safeImages = Array.isArray(images) ? images : [];
+    if (safeImages.length === 0) {
+        return;
+    }
+    previewContainer.innerHTML = safeImages.map((image, index) => {
+        const src = getItemPublishImageSrc(image);
+        const name = image?.filename || image?.name || `素材图片 ${index + 1}`;
+        return `
+            <div class="item-publish-preview-card">
+                <img src="${escapeHtml(src)}" alt="${escapeHtml(name)}">
+                <div class="item-publish-preview-meta">
+                    <div class="item-publish-preview-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
+                    <div class="item-publish-preview-size">素材图片</div>
+                </div>
+            </div>
+        `;
+    }).join('');
+    if (summary) {
+        summary.textContent = `已载入素材图片 ${safeImages.length} 张；如重新选择文件，将替换素材图片。`;
+    }
+}
+
+function startNewItemPublishMaterial() {
+    itemPublishLoadedMaterialId = null;
+    itemPublishLoadedMaterialImages = [];
+    const form = document.getElementById('itemPublishForm');
+    if (form) {
+        form.reset();
+    }
+    clearItemPublishForm(false);
+    updateItemPublishMaterialModeBadge();
+}
+
+async function saveItemPublishMaterial() {
+    if (itemPublishSavingMaterial) {
+        return;
+    }
+    const button = document.getElementById('itemPublishSaveMaterialBtn');
+    const originalHtml = button?.innerHTML || '';
+
+    try {
+        const values = getItemPublishFormValues();
+        validateItemPublishValues(values, { requireAccount: false, requireImages: true });
+        const images = values.files.length > 0
+            ? await convertPublishFilesToImages(values.files)
+            : [...itemPublishLoadedMaterialImages];
+        if (images.length === 0) {
+            throw new Error('请至少上传 1 张商品图片或载入素材图片');
+        }
+
+        itemPublishSavingMaterial = true;
+        if (button) {
+            button.disabled = true;
+            button.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>保存中...';
+        }
+
+        const payload = buildItemPublishMaterialPayload(values, images);
+        const isEdit = Boolean(itemPublishLoadedMaterialId);
+        const result = await requestItemPublishJson(
+            isEdit ? `/product-materials/${encodeURIComponent(itemPublishLoadedMaterialId)}` : '/product-materials',
+            {
+                method: isEdit ? 'PUT' : 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            }
+        );
+        const material = result.material || {};
+        itemPublishLoadedMaterialId = material.id || itemPublishLoadedMaterialId;
+        itemPublishLoadedMaterialImages = Array.isArray(material.images) ? material.images : images;
+        const imageInput = document.getElementById('publishImages');
+        if (imageInput) {
+            imageInput.value = '';
+        }
+        renderItemPublishStoredImagePreviews(itemPublishLoadedMaterialImages);
+        updateItemPublishMaterialModeBadge();
+        showToast(result.message || (isEdit ? '商品素材更新成功' : '商品素材保存成功'), 'success');
+        await loadItemPublishMaterials();
+    } catch (error) {
+        console.error('保存商品素材失败:', error);
+        showToast(error.message || '保存商品素材失败', 'danger');
+    } finally {
+        itemPublishSavingMaterial = false;
+        if (button) {
+            button.disabled = false;
+            button.innerHTML = originalHtml || '<i class="bi bi-save me-1"></i>保存素材';
+        }
+    }
+}
+
+async function loadItemPublishMaterials() {
+    const container = document.getElementById('publishMaterialList');
+    if (!container) {
+        return;
+    }
+    container.innerHTML = '<div class="text-muted small">正在加载素材...</div>';
+    try {
+        const data = await requestItemPublishJson('/product-materials?page=1&page_size=20');
+        itemPublishMaterials = data.list || [];
+        renderItemPublishMaterials();
+    } catch (error) {
+        console.error('加载商品素材失败:', error);
+        container.innerHTML = '<div class="item-publish-preview-empty">加载素材失败</div>';
+    }
+}
+
+function renderItemPublishMaterials() {
+    const container = document.getElementById('publishMaterialList');
+    if (!container) {
+        return;
+    }
+    if (!itemPublishMaterials.length) {
+        container.innerHTML = '<div class="item-publish-preview-empty">暂无素材，填写表单后可点击“保存素材”。</div>';
+        return;
+    }
+
+    container.innerHTML = itemPublishMaterials.map(material => {
+        const image = Array.isArray(material.images) && material.images.length ? material.images[0] : null;
+        const imageSrc = getItemPublishImageSrc(image);
+        const priceText = material.price !== null && material.price !== undefined ? `¥${material.price}` : '默认价';
+        const imageCount = Array.isArray(material.images) ? material.images.length : 0;
+        return `
+            <div class="item-publish-side-item ${itemPublishLoadedMaterialId === material.id ? 'is-active' : ''}">
+                ${imageSrc ? `<img class="item-publish-side-thumb" src="${escapeHtml(imageSrc)}" alt="素材图">` : '<div class="item-publish-side-thumb is-empty"><i class="bi bi-image"></i></div>'}
+                <div class="item-publish-side-main">
+                    <div class="item-publish-side-title" title="${escapeHtml(material.title || '')}">${escapeHtml(material.title || '未命名素材')}</div>
+                    <div class="item-publish-side-meta">${escapeHtml(priceText)} · ${imageCount} 张图</div>
+                    <div class="item-publish-side-actions">
+                        <button type="button" class="btn btn-sm btn-outline-primary" onclick="loadItemPublishMaterialToForm(${material.id})">载入</button>
+                        <button type="button" class="btn btn-sm btn-outline-danger" onclick="deleteItemPublishMaterial(${material.id})">删除</button>
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function loadItemPublishMaterialToForm(materialId) {
+    const material = itemPublishMaterials.find(item => Number(item.id) === Number(materialId));
+    if (!material) {
+        showToast('未找到商品素材，请刷新后重试', 'warning');
+        return;
+    }
+
+    document.getElementById('publishTitle').value = material.title || '';
+    document.getElementById('publishDescription').value = material.description || '';
+    document.getElementById('publishCurrentPrice').value = material.price ?? '';
+    document.getElementById('publishOriginalPrice').value = material.original_price ?? '';
+    document.getElementById('publishDeliveryChoice').value = material.delivery_method || '包邮';
+    document.getElementById('publishPostPrice').value = material.postage ?? '';
+    document.getElementById('publishCanSelfPickup').checked = Boolean(material.can_self_pickup);
+    const imageInput = document.getElementById('publishImages');
+    if (imageInput) {
+        imageInput.value = '';
+    }
+
+    itemPublishLoadedMaterialId = material.id;
+    itemPublishLoadedMaterialImages = Array.isArray(material.images) ? material.images : [];
+    handlePublishDeliveryChoiceChange();
+    renderItemPublishStoredImagePreviews(itemPublishLoadedMaterialImages);
+    updateItemPublishMaterialModeBadge();
+    renderItemPublishMaterials();
+    showToast('已载入商品素材，可直接发布或继续编辑', 'info');
+}
+
+async function deleteItemPublishMaterial(materialId) {
+    if (!confirm('确定删除该商品素材吗？')) {
+        return;
+    }
+    try {
+        const result = await requestItemPublishJson(`/product-materials/${encodeURIComponent(materialId)}`, { method: 'DELETE' });
+        if (Number(itemPublishLoadedMaterialId) === Number(materialId)) {
+            startNewItemPublishMaterial();
+        }
+        showToast(result.message || '商品素材已删除', 'success');
+        await loadItemPublishMaterials();
+    } catch (error) {
+        console.error('删除商品素材失败:', error);
+        showToast(error.message || '删除商品素材失败', 'danger');
+    }
+}
+
+function getItemPublishStatusBadge(status) {
+    const statusMap = {
+        success: { text: '成功', cls: 'text-bg-success' },
+        failed: { text: '失败', cls: 'text-bg-danger' },
+        publishing: { text: '发布中', cls: 'text-bg-primary' },
+        pending: { text: '等待中', cls: 'text-bg-secondary' }
+    };
+    const item = statusMap[status] || { text: status || '未知', cls: 'text-bg-light text-dark border' };
+    return `<span class="badge ${item.cls}">${escapeHtml(item.text)}</span>`;
+}
+
+async function loadItemPublishLogs() {
+    const container = document.getElementById('publishLogList');
+    if (!container) {
+        return;
+    }
+    container.innerHTML = '<div class="text-muted small">正在加载发布记录...</div>';
+    try {
+        const data = await requestItemPublishJson('/publish-logs?page=1&page_size=10');
+        itemPublishLogs = data.list || [];
+        renderItemPublishLogs();
+    } catch (error) {
+        console.error('加载发布记录失败:', error);
+        container.innerHTML = '<div class="item-publish-preview-empty">加载发布记录失败</div>';
+    }
+}
+
+function renderItemPublishLogs() {
+    const container = document.getElementById('publishLogList');
+    if (!container) {
+        return;
+    }
+    if (!itemPublishLogs.length) {
+        container.innerHTML = '<div class="item-publish-preview-empty">暂无发布记录</div>';
+        return;
+    }
+
+    container.innerHTML = itemPublishLogs.map(log => {
+        const timeText = log.updated_at || log.created_at || '';
+        const itemLink = log.item_url
+            ? `<a href="${escapeHtml(log.item_url)}" target="_blank" rel="noopener">查看商品</a>`
+            : (log.item_id ? `商品ID: ${escapeHtml(log.item_id)}` : '暂无商品链接');
+        const detail = log.error_message || log.sync_message || '';
+        return `
+            <div class="item-publish-log-item">
+                <div class="d-flex justify-content-between align-items-start gap-2">
+                    <div class="item-publish-side-title" title="${escapeHtml(log.title || '')}">${escapeHtml(log.title || '未命名商品')}</div>
+                    ${getItemPublishStatusBadge(log.status)}
+                </div>
+                <div class="item-publish-side-meta">账号 ${escapeHtml(log.account_id || '-')} · ${escapeHtml(timeText || '-')}</div>
+                <div class="item-publish-side-meta">${itemLink}</div>
+                ${detail ? `<div class="item-publish-log-detail" title="${escapeHtml(detail)}">${escapeHtml(detail)}</div>` : ''}
+            </div>
+        `;
+    }).join('');
+}
+
 async function submitItemPublishForm() {
     if (itemPublishSubmitting) {
         return;
     }
 
-    const cookieId = document.getElementById('publishCookieId')?.value || '';
-    const title = document.getElementById('publishTitle')?.value.trim() || '';
-    const description = document.getElementById('publishDescription')?.value.trim() || '';
-    const currentPrice = document.getElementById('publishCurrentPrice')?.value.trim() || '';
-    const originalPrice = document.getElementById('publishOriginalPrice')?.value.trim() || '';
-    const deliveryChoice = document.getElementById('publishDeliveryChoice')?.value || '包邮';
-    const postPrice = document.getElementById('publishPostPrice')?.value.trim() || '';
-    const canSelfPickup = document.getElementById('publishCanSelfPickup')?.checked || false;
-    const imageInput = document.getElementById('publishImages');
-    const files = Array.from(imageInput?.files || []);
+    const values = getItemPublishFormValues();
     const submitButton = document.getElementById('itemPublishSubmitBtn');
 
-    if (!cookieId) {
-        showToast('请选择发布账号', 'warning');
+    try {
+        validateItemPublishValues(values, { requireAccount: true, requireImages: true });
+    } catch (error) {
+        showToast(error.message || '请完善发布信息', 'warning');
         return;
     }
-    if (!title) {
-        showToast('请输入商品标题', 'warning');
-        return;
-    }
-    if (!description) {
-        showToast('请输入商品描述', 'warning');
-        return;
-    }
-    if (files.length === 0) {
-        showToast('请至少上传 1 张商品图片', 'warning');
-        return;
-    }
-    if (files.length > 9) {
-        showToast('单次最多上传 9 张图片', 'warning');
-        return;
-    }
-    if (originalPrice && !currentPrice) {
-        showToast('填写原价时必须同时填写现价', 'warning');
-        return;
-    }
-    if (deliveryChoice === '一口价' && !postPrice) {
-        showToast('运费方式为一口价时必须填写邮费', 'warning');
-        return;
-    }
-
-    const formData = new FormData();
-    formData.append('cookie_id', cookieId);
-    formData.append('title', title);
-    formData.append('description', description);
-    formData.append('current_price', currentPrice);
-    formData.append('original_price', originalPrice);
-    formData.append('delivery_choice', deliveryChoice);
-    formData.append('post_price', postPrice);
-    formData.append('can_self_pickup', canSelfPickup ? 'true' : 'false');
-    files.forEach(file => formData.append('images', file));
 
     itemPublishSubmitting = true;
     if (submitButton) {
@@ -10259,31 +11578,49 @@ async function submitItemPublishForm() {
     }
 
     try {
-        const response = await fetch(`${apiBase}/item-publish`, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${authToken}`
-            },
-            body: formData
-        });
+        let responseData;
+        if (values.files.length > 0) {
+            const formData = new FormData();
+            formData.append('cookie_id', values.accountId);
+            formData.append('title', values.title);
+            formData.append('description', values.description);
+            formData.append('current_price', values.currentPrice);
+            formData.append('original_price', values.originalPrice);
+            formData.append('delivery_choice', values.deliveryChoice);
+            formData.append('post_price', values.postPrice);
+            formData.append('can_self_pickup', values.canSelfPickup ? 'true' : 'false');
+            values.files.forEach(file => formData.append('images', file));
 
-        const responseText = await response.text();
-        let responseData = {};
-        try {
-            responseData = responseText ? JSON.parse(responseText) : {};
-        } catch (parseError) {
-            responseData = { detail: responseText || `HTTP ${response.status}` };
-        }
+            const response = await fetch(`${apiBase}/item-publish`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${authToken}`
+                },
+                body: formData
+            });
 
-        if (!response.ok) {
-            const errorMessage = responseData.detail || responseData.message || `HTTP ${response.status}`;
-            renderItemPublishResult({ message: errorMessage, detail: errorMessage }, false);
-            showToast(errorMessage, 'danger');
-            return;
+            const responseText = await response.text();
+            try {
+                responseData = responseText ? JSON.parse(responseText) : {};
+            } catch (parseError) {
+                responseData = { detail: responseText || `HTTP ${response.status}` };
+            }
+
+            if (!response.ok) {
+                throw new Error(responseData.detail || responseData.message || `HTTP ${response.status}`);
+            }
+        } else {
+            const payload = buildItemPublishJsonPayload(values, itemPublishLoadedMaterialImages);
+            responseData = await requestItemPublishJson('/product-publish', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
         }
 
         renderItemPublishResult(responseData, true);
         showToast(responseData.message || '商品发布成功', 'success');
+        await loadItemPublishLogs();
     } catch (error) {
         console.error('发布商品失败:', error);
         const errorMessage = error.message || '发布商品失败';
@@ -15010,6 +16347,10 @@ async function loadOrders() {
         // 加载订单列表
         await refreshOrdersData();
 
+        if (pendingOrderLocator) {
+            applyPendingOrderLocator();
+        }
+
         startOrdersStream();
     } catch (error) {
         console.error('加载订单列表失败:', error);
@@ -15080,6 +16421,56 @@ async function loadAllOrders() {
 // 根据Cookie加载订单
 async function loadOrdersByCookie() {
     filterOrders(false);
+}
+
+function normalizeOrderLocatorKeyword(value) {
+    return String(value || '').trim().replace(/@goofish$/i, '');
+}
+
+function applyPendingOrderLocator() {
+    const locator = pendingOrderLocator;
+    if (!locator) return false;
+
+    const searchInput = document.getElementById('orderSearchInput');
+    const statusFilter = document.getElementById('orderStatusFilter');
+    const cookieFilter = document.getElementById('orderCookieFilter');
+    const keyword = normalizeOrderLocatorKeyword(locator.keyword || locator.buyerId || locator.buyerNick || locator.chatId);
+
+    if (searchInput) searchInput.value = keyword;
+    if (statusFilter) statusFilter.value = '';
+    if (cookieFilter && locator.cookieId) {
+        const hasMatchedOption = Array.from(cookieFilter.options || []).some(option => option.value === locator.cookieId);
+        cookieFilter.value = hasMatchedOption ? locator.cookieId : '';
+    }
+
+    pendingOrderLocator = null;
+    filterOrders(true);
+
+    const matchedText = filteredOrdersData.length ? `，已定位到 ${filteredOrdersData.length} 条订单` : '，暂未匹配到订单';
+    showToast(`已跳转到独立订单页${matchedText}`, filteredOrdersData.length ? 'success' : 'info');
+    return true;
+}
+
+function openOrdersFromChat() {
+    const buyerKeyword = normalizeOrderLocatorKeyword(chatCurrentToUserId || chatCurrentSenderName || chatCurrentChatId);
+    if (!chatCurrentCookieId || !buyerKeyword) {
+        showToast('当前会话缺少账号或买家信息，无法定位订单', 'warning');
+        return;
+    }
+
+    pendingOrderLocator = {
+        cookieId: chatCurrentCookieId,
+        buyerId: normalizeOrderLocatorKeyword(chatCurrentToUserId),
+        buyerNick: chatCurrentSenderName,
+        chatId: chatCurrentChatId,
+        keyword: buyerKeyword,
+    };
+
+    const wasOrdersActive = isOrdersSectionActive();
+    showSection('orders');
+    if (wasOrdersActive) {
+        applyPendingOrderLocator();
+    }
 }
 
 // 筛选订单
@@ -15168,6 +16559,9 @@ function createOrderRow(order) {
     const specValue2 = escapeHtml(order.spec_value_2 || '');
     const quantity = escapeHtml(order.quantity || '-');
     const amountDisplay = escapeHtml(formatOrderAmountDisplay(order.amount));
+    const isPendingConfirm = normalizedStatus === 'partial_pending_finalize' || order.pending_platform_confirm === true;
+    const pendingConfirmError = escapeHtml(order.pending_confirm_error || '');
+    const pendingConfirmTitle = pendingConfirmError || (isPendingConfirm ? '卡券已发出，平台确认发货失败，等待补确认' : '');
 
     // 判断是否可以手动发货（允许多次发货，除了交易关闭的订单）
     const canDeliver = !['cancelled', 'refunding'].includes(normalizedStatus);
@@ -15213,7 +16607,8 @@ function createOrderRow(order) {
                 <span class="text-success fw-bold">${amountDisplay}</span>
             </td>
             <td>
-                <span class="badge ${statusClass}">${escapeHtml(statusText)}</span>
+                <span class="badge ${statusClass}" title="${pendingConfirmTitle}">${escapeHtml(statusText)}</span>
+                ${pendingConfirmError ? `<div class="small text-warning text-truncate mt-1" style="max-width: 140px;" title="${pendingConfirmError}">${pendingConfirmError}</div>` : ''}
             </td>
             <td>
                 <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${cookieId === '-' ? '' : cookieId}">
@@ -15222,6 +16617,10 @@ function createOrderRow(order) {
             </td>
             <td>
                 <div class="btn-group btn-group-sm" role="group">
+                    ${isPendingConfirm ? `
+                    <button class="btn btn-outline-warning btn-sm order-action-btn" data-order-action="confirm-retry" data-order-id="${orderId}" title="补确认发货（只调用平台确认，不重复发卡券）">
+                        <i class="bi bi-check2-circle"></i>
+                    </button>` : ''}
                     <button class="btn btn-outline-success btn-sm order-action-btn" data-order-action="deliver" data-order-id="${orderId}" title="手动发货" ${canDeliver ? '' : 'disabled'}>
                         <i class="bi bi-truck"></i>
                     </button>
@@ -15268,7 +16667,7 @@ function getOrderStatusText(status) {
         'pending_payment': '待付款',
         'pending_ship': '待发货',
         'partial_success': '部分发货',
-        'partial_pending_finalize': '部分待收尾',
+        'partial_pending_finalize': '待补确认',
         'shipped': '已发货',
         'completed': '交易成功',
         'success': '交易成功',
@@ -15921,6 +17320,8 @@ async function showOrderDetail(orderId) {
         const safeCreatedAt = escapeHtml(formatBeijingDateTimeWithSeconds(order.created_at));
         const safeUpdatedAt = escapeHtml(formatBeijingDateTimeWithSeconds(order.updated_at));
         const safeStatusText = escapeHtml(getOrderStatusText(order.order_status));
+        const safePendingConfirmError = escapeHtml(order.pending_confirm_error || '');
+        const pendingConfirmUnits = Number(order.pending_confirm_units || 0);
 
         const modalContent = `
             <div class="modal fade" id="orderDetailModal" tabindex="-1">
@@ -15944,6 +17345,7 @@ async function showOrderDetail(orderId) {
                                         <tr><td>买家昵称</td><td>${safeBuyerNick}</td></tr>
                                         <tr><td>Cookie账号</td><td>${safeCookieId}</td></tr>
                                         <tr><td>订单状态</td><td><span class="badge ${getOrderStatusClass(order.order_status)}">${safeStatusText}</span></td></tr>
+                                        ${safePendingConfirmError ? `<tr><td>补确认状态</td><td><span class="badge bg-warning-subtle text-warning-emphasis">待补确认${pendingConfirmUnits ? ` × ${pendingConfirmUnits}` : ''}</span><div class="small text-warning mt-1">${safePendingConfirmError}</div></td></tr>` : ''}
                                     </table>
                                 </div>
                                 <div class="col-md-6">
@@ -16204,6 +17606,45 @@ async function manualDeliverOrder(orderId) {
     }
 }
 
+// 手动补确认发货（只调用平台确认，不重复发送卡券）
+async function retryOrderPlatformConfirm(orderId) {
+    try {
+        const confirmed = confirm(`确定要补确认此订单吗？\n\n订单ID: ${orderId}\n\n只会调用闲鱼平台确认发货接口，不会重复发送卡券/发货内容。`);
+        if (!confirmed) {
+            return;
+        }
+
+        showToast('正在补确认发货...', 'info');
+
+        const response = await fetch(`${apiBase}/api/orders/${orderId}/confirm-retry`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        const result = await response.json();
+
+        if (response.ok) {
+            if (result.confirmed) {
+                showToast(result.message || '补确认成功', 'success');
+                refreshTodayDeliveryCount();
+            } else if (result.success) {
+                showToast(result.message || '没有待补确认记录', 'info');
+            } else {
+                showToast(`补确认失败: ${result.message || '未知错误'}`, 'warning');
+            }
+            await refreshOrdersData();
+        } else {
+            showToast(`补确认失败: ${result.detail || '未知错误'}`, 'danger');
+        }
+    } catch (error) {
+        console.error('补确认发货失败:', error);
+        showToast('补确认发货失败: ' + error.message, 'danger');
+    }
+}
+
 // 刷新订单状态
 async function refreshOrderStatus(orderId) {
     try {
@@ -16342,6 +17783,8 @@ document.addEventListener('DOMContentLoaded', function() {
 
             if (action === 'deliver') {
                 manualDeliverOrder(orderId);
+            } else if (action === 'confirm-retry') {
+                retryOrderPlatformConfirm(orderId);
             } else if (action === 'refresh') {
                 refreshOrderStatus(orderId);
             } else if (action === 'detail') {
@@ -17042,6 +18485,9 @@ async function confirmDeleteRecord() {
 // ================================
 let logAutoRefreshInterval = null;
 let currentLogLevel = '';
+let currentLogCenterTab = 'system';
+let taskLogRows = [];
+let taskLogCookieOptionsLoaded = false;
 
 // 加载系统日志
 async function loadSystemLogs() {
@@ -17182,6 +18628,249 @@ function scrollLogToTop() {
 function scrollLogToBottom() {
     const logContainer = document.getElementById('systemLogContainer');
     logContainer.scrollTop = logContainer.scrollHeight;
+}
+
+// 切换日志中心页签
+function switchLogCenterTab(tabName) {
+    currentLogCenterTab = tabName === 'task' ? 'task' : 'system';
+
+    const systemTab = document.getElementById('systemLogsTab');
+    const taskTab = document.getElementById('taskLogsTab');
+    const systemPane = document.getElementById('systemLogsPane');
+    const taskPane = document.getElementById('taskLogsPane');
+
+    if (systemTab) {
+        systemTab.classList.toggle('active', currentLogCenterTab === 'system');
+        systemTab.setAttribute('aria-selected', currentLogCenterTab === 'system' ? 'true' : 'false');
+    }
+    if (taskTab) {
+        taskTab.classList.toggle('active', currentLogCenterTab === 'task');
+        taskTab.setAttribute('aria-selected', currentLogCenterTab === 'task' ? 'true' : 'false');
+    }
+    if (systemPane) systemPane.classList.toggle('active', currentLogCenterTab === 'system');
+    if (taskPane) taskPane.classList.toggle('active', currentLogCenterTab === 'task');
+
+    if (currentLogCenterTab === 'task') {
+        initTaskLogsPane();
+    } else if (document.getElementById('systemLogContainer')) {
+        loadSystemLogs();
+    }
+}
+
+async function initTaskLogsPane() {
+    await loadTaskLogCookieOptions();
+    if (!taskLogRows.length) {
+        await loadTaskLogs();
+    } else {
+        renderTaskLogs();
+    }
+}
+
+async function loadTaskLogCookieOptions() {
+    const select = document.getElementById('taskLogCookieFilter');
+    if (!select || taskLogCookieOptionsLoaded) return;
+
+    try {
+        const response = await fetch(`${apiBase}/cookies/details`, {
+            headers: { 'Authorization': `Bearer ${getAuthToken()}` }
+        });
+        if (!response.ok) return;
+
+        const accounts = await response.json();
+        const currentValue = select.value;
+        select.innerHTML = '<option value="">全部账号</option>';
+        (Array.isArray(accounts) ? accounts : []).forEach(account => {
+            const option = document.createElement('option');
+            option.value = account.id || '';
+            const remark = account.remark ? `（${account.remark}）` : '';
+            option.textContent = `${account.id || '未知账号'}${remark}`;
+            select.appendChild(option);
+        });
+        select.value = currentValue;
+        taskLogCookieOptionsLoaded = true;
+    } catch (error) {
+        console.warn('加载任务日志账号筛选失败:', error);
+    }
+}
+
+async function loadTaskLogs() {
+    const loading = document.getElementById('loadingTaskLogs');
+    const table = document.getElementById('taskLogsTable');
+    const empty = document.getElementById('noTaskLogs');
+    const type = document.getElementById('taskLogTypeFilter')?.value || 'all';
+    const cookieId = document.getElementById('taskLogCookieFilter')?.value || '';
+    const limit = document.getElementById('taskLogLimit')?.value || '100';
+
+    if (loading) loading.style.display = 'block';
+    if (table) table.style.display = 'none';
+    if (empty) empty.style.display = 'none';
+
+    try {
+        const query = new URLSearchParams({ task_type: type, limit, offset: '0' });
+        if (cookieId) query.set('cookie_id', cookieId);
+
+        const response = await fetch(`${apiBase}/api/task-logs?${query.toString()}`, {
+            headers: { 'Authorization': `Bearer ${getAuthToken()}` }
+        });
+        if (!response.ok) {
+            throw new Error(`任务日志加载失败: HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        taskLogRows = (data.data || []).map(log => normalizeTaskLog(log)).sort((a, b) => {
+            const timeA = new Date(a.created_at || 0).getTime();
+            const timeB = new Date(b.created_at || 0).getTime();
+            return timeB - timeA;
+        });
+
+        renderTaskLogs();
+        const lastUpdate = document.getElementById('taskLogsLastUpdate');
+        if (lastUpdate) lastUpdate.textContent = '最后更新: ' + new Date().toLocaleTimeString('zh-CN');
+    } catch (error) {
+        console.error('加载任务日志失败:', error);
+        if (empty) {
+            empty.style.display = 'block';
+            empty.innerHTML = `
+                <i class="bi bi-exclamation-triangle" style="font-size: 3rem; color: #dc3545;"></i>
+                <p class="mt-2 text-danger mb-0">加载任务日志失败：${escapeHtml(error.message || '未知错误')}</p>
+            `;
+        }
+        showToast('加载任务日志失败', 'danger');
+    } finally {
+        if (loading) loading.style.display = 'none';
+    }
+}
+
+function normalizeTaskLog(log) {
+    const type = log.task_type || 'other_task';
+    return {
+        ...log,
+        task_type: type,
+        task_label: log.task_label || getTaskTypeLabel(type),
+        display_object: log.object_id || log.order_id || log.item_id || '-',
+        created_at: log.created_at || log.updated_at || ''
+    };
+}
+
+function renderTaskLogs() {
+    const tbody = document.getElementById('taskLogsTableBody');
+    const table = document.getElementById('taskLogsTable');
+    const empty = document.getElementById('noTaskLogs');
+    const statusFilter = document.getElementById('taskLogStatusFilter')?.value || 'all';
+    if (!tbody || !table || !empty) return;
+
+    const filtered = taskLogRows.filter(log => matchTaskLogStatusFilter(log.status, statusFilter));
+    updateTaskLogStats(filtered);
+
+    if (!filtered.length) {
+        table.style.display = 'none';
+        empty.style.display = 'block';
+        empty.innerHTML = `
+            <i class="bi bi-journal-text" style="font-size: 3rem; color: #ccc;"></i>
+            <p class="mt-2 text-muted mb-0">暂无任务日志</p>
+        `;
+        tbody.innerHTML = '';
+        return;
+    }
+
+    tbody.innerHTML = filtered.map(log => `
+        <tr>
+            <td class="text-nowrap">${escapeHtml(formatTaskLogTime(log.created_at))}</td>
+            <td>${renderTaskTypeBadge(log.task_type, log.task_label)}</td>
+            <td><span class="task-log-account" title="${escapeHtml(log.cookie_id || '')}">${escapeHtml(log.cookie_id || '-')}</span></td>
+            <td><span class="task-log-object" title="${escapeHtml(log.display_object || '')}">${escapeHtml(log.display_object || '-')}</span></td>
+            <td>${escapeHtml(log.buyer_nick || log.buyer_id || '-')}</td>
+            <td>${renderTaskStatusBadge(log.status)}</td>
+            <td class="task-log-message" title="${escapeHtml(log.message || '')}">${escapeHtml(log.message || '-')}</td>
+            <td><span class="task-log-batch" title="${escapeHtml(log.batch_id || '')}">${escapeHtml(shortenTaskLogBatchId(log.batch_id))}</span></td>
+        </tr>
+    `).join('');
+    table.style.display = 'table';
+    empty.style.display = 'none';
+}
+
+function matchTaskLogStatusFilter(status, filter) {
+    if (!filter || filter === 'all') return true;
+    const value = String(status || '').toLowerCase();
+    if (filter === 'success') return ['success', 'partial_success', 'already_rated', 'already_red_flower'].includes(value);
+    if (filter === 'skipped') return ['skipped', 'missing_template'].includes(value);
+    if (filter === 'cookie_expired') return ['cookie_expired', 'session_expired'].includes(value);
+    if (filter === 'processing') return ['processing', 'started', 'running'].includes(value);
+    return value === filter;
+}
+
+function updateTaskLogStats(rows) {
+    const total = rows.length;
+    const success = rows.filter(row => matchTaskLogStatusFilter(row.status, 'success')).length;
+    const failed = rows.filter(row => String(row.status || '').toLowerCase() === 'failed').length;
+    const skipped = rows.filter(row => matchTaskLogStatusFilter(row.status, 'skipped') || matchTaskLogStatusFilter(row.status, 'cookie_expired')).length;
+
+    setTextContent('taskLogTotalCount', total);
+    setTextContent('taskLogSuccessCount', success);
+    setTextContent('taskLogFailedCount', failed);
+    setTextContent('taskLogSkippedCount', skipped);
+}
+
+function setTextContent(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = String(value);
+}
+
+function getTaskTypeLabel(type) {
+    const labels = {
+        auto_comment: '自动评价',
+        auto_red_flower: '求小红花',
+        item_polish: '商品擦亮',
+        login_renew: '登录续期',
+        cookie_refresh: 'Cookie刷新',
+        other_task: '其他任务'
+    };
+    return labels[type] || '其他任务';
+}
+
+function renderTaskTypeBadge(type, label) {
+    const config = {
+        auto_comment: ['chat-heart', 'task-type-comment'],
+        auto_red_flower: ['flower1', 'task-type-red-flower'],
+        item_polish: ['stars', 'task-type-polish'],
+        login_renew: ['shield-check', 'task-type-login'],
+        cookie_refresh: ['arrow-repeat', 'task-type-cookie'],
+        other_task: ['box-seam', 'task-type-other']
+    };
+    const [icon, cls] = config[type] || config.other_task;
+    return `<span class="task-type-badge ${cls}"><i class="bi bi-${icon}"></i>${escapeHtml(label || getTaskTypeLabel(type))}</span>`;
+}
+
+function renderTaskStatusBadge(status) {
+    const value = String(status || '').toLowerCase();
+    const map = {
+        success: ['bg-success', '成功'],
+        failed: ['bg-danger', '失败'],
+        skipped: ['bg-secondary', '已跳过'],
+        cookie_expired: ['bg-warning text-dark', 'Cookie过期'],
+        session_expired: ['bg-warning text-dark', 'Session过期'],
+        processing: ['bg-info', '处理中'],
+        started: ['bg-info', '处理中'],
+        running: ['bg-info', '运行中'],
+        partial_success: ['bg-primary', '部分成功'],
+        already_rated: ['bg-success', '已评价'],
+        already_red_flower: ['bg-success', '已求小红花'],
+        missing_template: ['bg-secondary', '缺少模板']
+    };
+    const [cls, text] = map[value] || ['bg-secondary', status || '未知'];
+    return `<span class="badge ${cls}">${escapeHtml(text)}</span>`;
+}
+
+function formatTaskLogTime(value) {
+    if (!value) return '-';
+    const date = parseUtcDateTime(value) || new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString('zh-CN');
+}
+
+function shortenTaskLogBatchId(batchId) {
+    if (!batchId) return '-';
+    const value = String(batchId);
+    return value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
 }
 
 // 打开日志导出模态框
@@ -18558,7 +20247,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v2.0.0';
+const DEFAULT_VERSION = 'v2.0.3';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -18669,9 +20358,44 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v2.0.0',
+    version: 'v2.0.3',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v2.0.3',
+            date: '2026-06-16',
+            updates: [
+                '【新功能】新增待补确认订单补偿能力，发货后平台确认失败的订单会记录待补确认状态并提供补偿入口',
+                '【新功能】在线客服会话新增拉黑入口，便于快速处理异常买家或商品会话',
+                '【优化】会话预览优先显示最新消息，补全客服会话头像昵称，并将客服订单入口跳转到独立订单页',
+                '【修复】停止终态订单重复补确认，避免已完成、已关闭等终态订单被重复处理',
+                '【文档】精简 README 并拆分部署、配置、使用、FAQ 和发版说明文档'
+            ]
+        },
+        {
+            version: 'v2.0.2',
+            date: '2026-06-03',
+            updates: [
+                '【新功能】新增黑名单管理能力，支持按买家、账号和商品维护拦截规则，自动回复、客服手动发送和发货流程会统一识别黑名单',
+                '【新功能】重写在线客服为直连闲鱼 IM 会话体验，支持账号连接状态、远程会话列表、历史消息分页和实时消息合并展示',
+                '【优化】在线客服三栏界面新增账号连接/断开、IM 来源标识、未读数、加载更多会话和更早消息入口，客服处理更集中',
+                '【修复】修复在线客服拉取会话时新建临时 WebSocket 导致主监听连接被挤下线的问题，改为复用主连接按 mid 分发 IM 响应',
+                '【修复】补强在线客服远程消息解析，文本、图片、卡片等消息可正常展示，并在 IM 异常时回退本地缓存和订单会话入口',
+            ]
+        },
+        {
+            version: 'v2.0.1',
+            date: '2026-05-28',
+            updates: [
+                '【新功能】新增商品发布素材管理与批量发布能力，支持素材集中维护并批量执行发布任务',
+                '【新功能】新增历史订单补评价与自动求小红花流程，补齐订单售后运营自动化能力',
+                '【新功能】新增统一任务日志中心，集中查看任务执行日志并提升排查效率',
+                '【优化】仪表盘公告卡片支持摘要展示并优化卡片布局，同时允许关闭公告提示',
+                '【修复】修复在线客服 Web 端自发消息不显示、消息时间 UTC 偏移和系统文案污染买家昵称等问题',
+                '【修复】修复滑块验证后 _m_h5_tk 域名落点导致 Token 刷新非法请求，账密登录后优先快照 goofish 域 Token',
+                '【修复】修复自动评价接口调用链路，改为本地评价接口并补齐补评任务',
+            ]
+        },
         {
             version: 'v2.0.0',
             date: '2026-05-19',
@@ -20657,10 +22381,21 @@ let chatCurrentToUserId = '';
 let chatCurrentSenderName = '';
 let chatCurrentItemId = '';
 let chatSessionsCache = [];
+let chatAccountsCache = [];
+let chatCurrentAccount = null;
+let chatSessionsNextCursor = null;
+let chatSessionsHasMore = false;
+let chatMessagesNextCursor = null;
+let chatMessagesHasMore = false;
+let chatMessagesSource = 'remote_im';
 let chatOldestMsgId = null;
 let chatSseAbortController = null;
 let chatSseRetryCount = 0;
 let chatSseShouldRun = false;
+let chatUserInfoCache = {};
+let chatUserInfoHydrationTimer = null;
+const CHAT_USER_INFO_MISS_TTL_MS = 10 * 60 * 1000;
+let chatBlacklistState = { loading: false, blacklisted: false, can_unblock: false, scope: '', record: null, account_record: null };
 
 function buildSafeCheckboxId(prefix, rawValue) {
     const normalized = String(rawValue || '')
@@ -20696,17 +22431,357 @@ function resolveSessionAvatar(session) {
     return { type: 'text', value: (displayName || '?').charAt(0).toUpperCase() };
 }
 
+function buildChatUserInfoCacheKey(cookieId, chatId) {
+    return `${String(cookieId || '').trim()}::${String(chatId || '').trim().replace(/@goofish$/i, '')}`;
+}
+
+function isValidChatDisplayName(value) {
+    const text = String(value || '').trim();
+    if (!text || text === '-' || text === '未知用户') return false;
+    if (/^\d+$/.test(text)) return false;
+    return !['工作台通知', '订单', '交易消息', '买家', '全部'].includes(text);
+}
+
+function applyChatUserInfoToSession(session, info) {
+    if (!session || !info) return { session, changed: false };
+    const updates = {};
+    const avatar = String(info.avatar || '').trim();
+    const nick = String(info.fish_nick || info.buyer_name_resolved || '').trim();
+    const senderId = String(info.sender_id || '').trim();
+
+    if (avatar && avatar !== String(session.avatar || '')) {
+        updates.avatar = avatar;
+    }
+    if (isValidChatDisplayName(nick)) {
+        if (nick !== String(session.fish_nick || '')) updates.fish_nick = nick;
+        if (nick !== String(session.buyer_name_resolved || '')) updates.buyer_name_resolved = nick;
+        if (!isValidChatDisplayName(session.buyer_name) || String(session.buyer_name || '').trim() === String(session.buyer_id || '').trim()) {
+            updates.buyer_name = nick;
+        }
+        if (!isValidChatDisplayName(session.sender_name) || String(session.sender_name || '').trim() === String(session.sender_id || '').trim()) {
+            updates.sender_name = nick;
+        }
+    }
+    if (senderId && !session.sender_id) {
+        updates.sender_id = senderId;
+    }
+
+    return Object.keys(updates).length > 0
+        ? { session: { ...session, ...updates }, changed: true }
+        : { session, changed: false };
+}
+
+function applyCachedChatUserInfosToSessions() {
+    if (!chatCurrentCookieId || !chatSessionsCache.length) return false;
+    let changed = false;
+    chatSessionsCache = chatSessionsCache.map(session => {
+        const cacheKey = buildChatUserInfoCacheKey(chatCurrentCookieId, session?.chat_id);
+        const cached = chatUserInfoCache[cacheKey];
+        if (!cached || cached.__miss) return session;
+        const result = applyChatUserInfoToSession(session, cached);
+        changed = changed || result.changed;
+        return result.session;
+    });
+    return changed;
+}
+
+function shouldHydrateChatSessionUserInfo(session) {
+    if (!chatCurrentCookieId || !session?.chat_id) return false;
+    const cacheKey = buildChatUserInfoCacheKey(chatCurrentCookieId, session.chat_id);
+    const cached = chatUserInfoCache[cacheKey];
+    if (cached?.__miss && Date.now() - Number(cached.cachedAt || 0) < CHAT_USER_INFO_MISS_TTL_MS) return false;
+
+    const displayName = resolveSessionDisplayName(session);
+    return !session.avatar || !isValidChatDisplayName(displayName);
+}
+
+function syncActiveChatHeaderName() {
+    if (!chatCurrentChatId) return;
+    const currentSession = chatSessionsCache.find(session => session.chat_id === chatCurrentChatId);
+    if (!currentSession) return;
+    chatCurrentSenderName = resolveSessionDisplayName(currentSession);
+    const headerName = document.getElementById('chatHeaderName');
+    if (headerName) headerName.textContent = chatCurrentSenderName;
+}
+
+function getChatBlacklistScopeLabel(scope) {
+    return { item: '商品级', account: '账号级', user: '用户级' }[scope] || '其他范围';
+}
+
+function resetChatBlacklistState() {
+    chatBlacklistState = { loading: false, blacklisted: false, can_unblock: false, scope: '', record: null, account_record: null };
+    renderChatBlacklistButton();
+}
+
+function renderChatBlacklistButton() {
+    const btn = document.getElementById('chatBlacklistBtn');
+    const text = document.getElementById('chatBlacklistBtnText');
+    if (!btn) return;
+
+    const hasBuyer = Boolean(chatCurrentCookieId && chatCurrentChatId && chatCurrentToUserId);
+    btn.classList.remove('btn-outline-danger', 'btn-danger', 'btn-outline-secondary', 'btn-outline-warning');
+
+    if (!hasBuyer) {
+        btn.disabled = true;
+        btn.title = '缺少买家ID，无法拉黑';
+        btn.classList.add('btn-outline-secondary');
+        btn.innerHTML = '<i class="bi bi-person-slash"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">拉黑</span>';
+        return;
+    }
+
+    if (chatBlacklistState.loading) {
+        btn.disabled = true;
+        btn.title = '正在查询黑名单状态';
+        btn.classList.add('btn-outline-secondary');
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">检查中</span>';
+        return;
+    }
+
+    if (chatBlacklistState.blacklisted) {
+        if (chatBlacklistState.can_unblock) {
+            btn.disabled = false;
+            btn.title = '解除当前账号级黑名单';
+            btn.classList.add('btn-outline-warning');
+            btn.innerHTML = '<i class="bi bi-person-check"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">解除拉黑</span>';
+        } else {
+            btn.disabled = true;
+            btn.title = `已命中${getChatBlacklistScopeLabel(chatBlacklistState.scope)}黑名单，请到黑名单管理解除`;
+            btn.classList.add('btn-outline-secondary');
+            btn.innerHTML = '<i class="bi bi-shield-lock"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">已拉黑</span>';
+        }
+        return;
+    }
+
+    btn.disabled = false;
+    btn.title = '将当前买家加入当前账号黑名单';
+    btn.classList.add('btn-outline-danger');
+    btn.innerHTML = '<i class="bi bi-person-slash"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">拉黑</span>';
+    if (text) text.textContent = '拉黑';
+}
+
+async function refreshChatBlacklistStatus() {
+    if (!chatCurrentCookieId || !chatCurrentToUserId) {
+        resetChatBlacklistState();
+        return;
+    }
+
+    const cookieId = chatCurrentCookieId;
+    const buyerId = chatCurrentToUserId;
+    chatBlacklistState = { ...chatBlacklistState, loading: true };
+    renderChatBlacklistButton();
+
+    try {
+        const token = getAuthToken();
+        const response = await fetch(`${apiBase}/api/chat/blacklist-status?cookie_id=${encodeURIComponent(cookieId)}&buyer_id=${encodeURIComponent(buyerId)}`, {
+            headers: token ? { 'Authorization': `Bearer ${token}` } : {},
+            cache: 'no-store',
+        });
+        if (response.status === 401) {
+            stopChatStream();
+            localStorage.removeItem('auth_token');
+            window.location.href = '/';
+            return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const result = await response.json();
+        if (cookieId !== chatCurrentCookieId || buyerId !== chatCurrentToUserId) return;
+        const data = result?.data || {};
+        chatBlacklistState = {
+            loading: false,
+            blacklisted: Boolean(data.blacklisted),
+            can_unblock: Boolean(data.can_unblock),
+            scope: data.scope || '',
+            record: data.record || null,
+            account_record: data.account_record || null,
+        };
+    } catch (error) {
+        console.debug('查询客服黑名单状态失败:', error);
+        chatBlacklistState = { ...chatBlacklistState, loading: false };
+    }
+    renderChatBlacklistButton();
+}
+
+async function toggleChatBlacklist() {
+    if (!chatCurrentCookieId || !chatCurrentToUserId) {
+        showToast('当前会话缺少买家ID，无法拉黑', 'warning');
+        return;
+    }
+    if (chatBlacklistState.blacklisted && !chatBlacklistState.can_unblock) {
+        showToast(`该买家命中${getChatBlacklistScopeLabel(chatBlacklistState.scope)}黑名单，请到黑名单管理解除`, 'warning');
+        return;
+    }
+
+    const action = chatBlacklistState.blacklisted ? 'unblock' : 'block';
+    const actionLabel = action === 'block' ? '拉黑' : '解除拉黑';
+    const confirmMessage = action === 'block'
+        ? `确认将买家 ${chatCurrentSenderName || chatCurrentToUserId} 加入当前账号黑名单吗？\n\n加入后自动回复、客服发送和发货流程都会拦截该买家。`
+        : `确认解除买家 ${chatCurrentSenderName || chatCurrentToUserId} 的当前账号黑名单吗？`;
+    if (!window.confirm(confirmMessage)) return;
+
+    chatBlacklistState = { ...chatBlacklistState, loading: true };
+    renderChatBlacklistButton();
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/chat/blacklist-toggle`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                cookie_id: chatCurrentCookieId,
+                buyer_id: chatCurrentToUserId,
+                buyer_nick: chatCurrentSenderName || '',
+                action,
+                reason: '在线客服手动拉黑',
+            }),
+        });
+        const data = result?.data || {};
+        chatBlacklistState = {
+            loading: false,
+            blacklisted: Boolean(data.blacklisted),
+            can_unblock: Boolean(data.can_unblock),
+            scope: data.scope || '',
+            record: data.record || null,
+            account_record: data.account_record || null,
+        };
+        showToast(result.message || `${actionLabel}成功`, result.success === false ? 'warning' : 'success');
+    } catch (error) {
+        console.error(`${actionLabel}失败:`, error);
+        chatBlacklistState = { ...chatBlacklistState, loading: false };
+        showToast(`${actionLabel}失败`, 'danger');
+    }
+    renderChatBlacklistButton();
+}
+
+function rerenderChatSessionsAfterUserInfoUpdate() {
+    syncActiveChatHeaderName();
+    const keyword = String(document.getElementById('chatSearchInput')?.value || '').trim();
+    if (keyword) {
+        filterChatSessions();
+    } else {
+        renderChatSessions(chatSessionsCache);
+    }
+}
+
+function applyChatUserInfosToSessions(users) {
+    if (!users || typeof users !== 'object') return false;
+    let changed = false;
+    chatSessionsCache = chatSessionsCache.map(session => {
+        const chatId = String(session?.chat_id || '').trim().replace(/@goofish$/i, '');
+        const info = users[chatId];
+        if (!info) return session;
+        const result = applyChatUserInfoToSession(session, info);
+        changed = changed || result.changed;
+        return result.session;
+    });
+    if (changed) {
+        rerenderChatSessionsAfterUserInfoUpdate();
+    }
+    return changed;
+}
+
+function scheduleChatUserInfoHydration(sessions) {
+    if (chatUserInfoHydrationTimer) {
+        clearTimeout(chatUserInfoHydrationTimer);
+    }
+    chatUserInfoHydrationTimer = setTimeout(() => {
+        chatUserInfoHydrationTimer = null;
+        hydrateChatUserInfos(sessions);
+    }, 120);
+}
+
+async function hydrateChatUserInfos(sessions) {
+    if (!chatCurrentCookieId || !Array.isArray(sessions) || !sessions.length) return;
+    if (applyCachedChatUserInfosToSessions()) {
+        rerenderChatSessionsAfterUserInfoUpdate();
+        return;
+    }
+
+    const seen = new Set();
+    const queries = [];
+    for (const session of sessions) {
+        const chatId = String(session?.chat_id || '').trim().replace(/@goofish$/i, '');
+        if (!chatId || seen.has(chatId) || !shouldHydrateChatSessionUserInfo(session)) continue;
+        seen.add(chatId);
+        queries.push({
+            chat_id: chatId,
+            sender_id: session.sender_id || session.buyer_id || '',
+            buyer_id: session.buyer_id || '',
+            sender_name: session.sender_name || '',
+            buyer_name: session.buyer_name || session.buyer_name_resolved || session.fish_nick || '',
+            session_type: session.session_type || 1,
+            message_id: session.message_id || '',
+        });
+        if (queries.length >= 24) break;
+    }
+    if (!queries.length) return;
+
+    try {
+        const token = getAuthToken();
+        const response = await fetch(`${apiBase}/api/chat/avatars`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify({ cookie_id: chatCurrentCookieId, queries }),
+        });
+        if (response.status === 401) {
+            stopChatStream();
+            localStorage.removeItem('auth_token');
+            window.location.href = '/';
+            return;
+        }
+        if (!response.ok) return;
+        const result = await response.json();
+        const users = result?.users || {};
+        const now = Date.now();
+
+        queries.forEach(query => {
+            const chatId = String(query.chat_id || '').trim();
+            const cacheKey = buildChatUserInfoCacheKey(chatCurrentCookieId, chatId);
+            const info = users[chatId];
+            chatUserInfoCache[cacheKey] = info && (info.avatar || info.fish_nick || info.buyer_name_resolved)
+                ? { ...info, cachedAt: now }
+                : { __miss: true, cachedAt: now };
+        });
+
+        applyChatUserInfosToSessions(users);
+    } catch (error) {
+        console.debug('批量补全客服头像失败:', error);
+    }
+}
+
+function resolveSessionMessagePreview(session) {
+    const messagePreview = normalizeChatSessionPreview(session?.content, session?.content_type);
+    if (messagePreview && messagePreview !== '[系统/占位消息]' && messagePreview !== '[暂无文本内容]') {
+        return messagePreview;
+    }
+    return '';
+}
+
 function resolveSessionPreview(session) {
-    return session?.item_title
+    return resolveSessionMessagePreview(session)
         || session?.order_status_name
-        || normalizeChatSessionPreview(session?.content, session?.content_type);
+        || session?.item_title
+        || '[暂无文本内容]';
+}
+
+function resolveSessionSubMeta(session) {
+    const preview = resolveSessionPreview(session);
+    const parts = [];
+    [session?.item_title, session?.order_status_name, session?.item_tips].forEach(value => {
+        const text = String(value || '').trim();
+        if (text && text !== preview && !parts.includes(text)) {
+            parts.push(text);
+        }
+    });
+    return parts.join(' · ');
 }
 
 function getChatSessionState(session) {
     return {
         tag: '',
         preview: resolveSessionPreview(session),
-        submeta: session?.order_status_name || session?.item_tips || '',
+        submeta: resolveSessionSubMeta(session),
         className: ''
     };
 }
@@ -20738,9 +22813,9 @@ function scoreChatSession(session) {
 
 function sortChatSessions(sessions) {
     return [...(sessions || [])].sort((a, b) => {
-        const scoreDiff = scoreChatSession(b) - scoreChatSession(a);
-        if (scoreDiff !== 0) return scoreDiff;
-        return String(b?.created_at || '').localeCompare(String(a?.created_at || ''));
+        const timeDiff = String(b?.created_at || b?.lastMessageTime || '').localeCompare(String(a?.created_at || a?.lastMessageTime || ''));
+        if (timeDiff !== 0) return timeDiff;
+        return scoreChatSession(b) - scoreChatSession(a);
     });
 }
 
@@ -20756,6 +22831,15 @@ function mergeChatSessionLists(primarySessions, secondarySessions) {
     return sortChatSessions(merged);
 }
 
+function getChatAccountStatus(account) {
+    const state = account?.connection_state || 'not_running';
+    if (!account?.enabled) return { label: '已断开', className: 'offline' };
+    if (account?.connected) return { label: '已连接', className: 'online' };
+    if (state === 'connecting' || state === 'reconnecting') return { label: '连接中', className: 'pending' };
+    if (account?.running) return { label: '运行中', className: 'pending' };
+    return { label: '未连接', className: 'offline' };
+}
+
 async function refreshChatAccounts() {
     const body = document.getElementById('chatAccountsBody');
     if (!body) return;
@@ -20767,16 +22851,34 @@ async function refreshChatAccounts() {
             return;
         }
         const accounts = result.accounts || [];
+        chatAccountsCache = accounts;
+        chatCurrentAccount = accounts.find(account => account.id === chatCurrentCookieId) || null;
         if (!accounts.length) {
             body.innerHTML = '<div class="text-center text-muted py-4 small">暂无可用账号</div>';
             return;
         }
         body.innerHTML = '';
         accounts.forEach(account => {
+            const status = getChatAccountStatus(account);
+            const actionLabel = account.enabled && (account.running || account.connected) ? '断开' : '连接';
+            const actionIcon = actionLabel === '断开' ? 'bi-plug' : 'bi-play-circle';
             const div = document.createElement('div');
             div.className = 'chat-account-item' + (account.id === chatCurrentCookieId ? ' active' : '');
-            div.innerHTML = `<div class="chat-account-dot ${account.connected ? 'online' : 'offline'}"></div><div class="chat-account-name" title="${escapeHtml(account.id)}">${escapeHtml(account.name || account.id)}</div>`;
+            div.innerHTML = `
+                <div class="chat-account-dot ${status.className}"></div>
+                <div class="chat-account-main">
+                    <div class="chat-account-name" title="${escapeHtml(account.id)}">${escapeHtml(account.name || account.id)}</div>
+                    <div class="chat-account-status ${status.className}" title="${escapeHtml(account.message_stream_note || '')}">${escapeHtml(status.label)}</div>
+                </div>
+                <button class="chat-account-action" title="${escapeHtml(actionLabel)}">
+                    <i class="bi ${actionIcon}"></i>
+                </button>
+            `;
             div.onclick = () => selectChatAccount(account.id);
+            div.querySelector('.chat-account-action')?.addEventListener('click', event => {
+                event.stopPropagation();
+                toggleChatAccountConnection(account.id, actionLabel === '断开');
+            });
             body.appendChild(div);
         });
     } catch (error) {
@@ -20785,12 +22887,41 @@ async function refreshChatAccounts() {
     }
 }
 
+async function toggleChatAccountConnection(cookieId, disconnect = false) {
+    try {
+        const endpoint = disconnect ? 'disconnect' : 'connect';
+        const result = await fetchJSON(`${apiBase}/api/chat/${endpoint}/${encodeURIComponent(cookieId)}`, { method: 'POST' });
+        if (result.success) {
+            showToast(result.message || (disconnect ? '已断开连接' : '连接已启动'), 'success');
+        } else {
+            showToast(result.detail || result.message || '操作失败', 'danger');
+        }
+    } catch (error) {
+        console.error('切换客服连接失败:', error);
+        showToast(disconnect ? '断开失败' : '连接失败', 'danger');
+    }
+    await refreshChatAccounts();
+    if (cookieId === chatCurrentCookieId) {
+        await refreshChatSessions();
+    }
+}
+
 async function selectChatAccount(cookieId) {
+    if (chatUserInfoHydrationTimer) {
+        clearTimeout(chatUserInfoHydrationTimer);
+        chatUserInfoHydrationTimer = null;
+    }
     chatCurrentCookieId = cookieId;
+    chatCurrentAccount = chatAccountsCache.find(account => account.id === cookieId) || null;
     chatCurrentChatId = '';
     chatCurrentToUserId = '';
     chatCurrentSenderName = '';
     chatCurrentItemId = '';
+    resetChatBlacklistState();
+    chatSessionsNextCursor = null;
+    chatSessionsHasMore = false;
+    chatMessagesNextCursor = null;
+    chatMessagesHasMore = false;
     chatOldestMsgId = null;
     const placeholder = document.getElementById('chatMainPlaceholder');
     const active = document.getElementById('chatActiveArea');
@@ -20801,7 +22932,7 @@ async function selectChatAccount(cookieId) {
     await refreshChatSessions();
 }
 
-async function refreshChatSessions() {
+async function refreshChatSessions(append = false) {
     const body = document.getElementById('chatSessionsBody');
     if (!body) return;
     if (!chatCurrentCookieId) {
@@ -20809,25 +22940,43 @@ async function refreshChatSessions() {
         chatSessionsCache = [];
         return;
     }
-    body.innerHTML = '<div class="text-center text-muted py-4 small"><div class="spinner-border spinner-border-sm"></div></div>';
+    if (!append) {
+        chatSessionsNextCursor = null;
+        chatSessionsHasMore = false;
+        body.innerHTML = '<div class="text-center text-muted py-4 small"><div class="spinner-border spinner-border-sm"></div></div>';
+    }
     try {
-        const result = await fetchJSON(`${apiBase}/api/chat/sessions?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&include_order_fallback=true&limit=120`);
+        let url = `${apiBase}/api/chat/sessions?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&include_order_fallback=true&remote=true&limit=60`;
+        if (append && chatSessionsNextCursor) {
+            url += `&cursor=${encodeURIComponent(chatSessionsNextCursor)}`;
+        }
+        const result = await fetchJSON(url);
         if (!result.success) {
             body.innerHTML = '<div class="text-center text-muted py-4 small">加载失败</div>';
             return;
         }
-        chatSessionsCache = sortChatSessions(result.sessions || []);
-        chatSessionsCache = await enrichSessionsWithOrdersFallback(chatSessionsCache);
+        chatSessionsNextCursor = result.next_cursor || null;
+        chatSessionsHasMore = Boolean(result.has_more && chatSessionsNextCursor);
+        const incomingSessions = sortChatSessions(result.sessions || []);
+        chatSessionsCache = append ? mergeChatSessionLists(chatSessionsCache, incomingSessions) : incomingSessions;
+        if (!append && result.remote_error) {
+            console.debug('直连IM会话提示:', result.remote_error);
+        }
         if (!chatSessionsCache.length) {
-            body.innerHTML = '<div class="text-center text-muted py-4 small">暂无会话记录；若该账号已有订单，会自动显示可补拉历史的会话入口</div>';
+            const hint = result.remote_error || '暂无会话记录';
+            body.innerHTML = `<div class="text-center text-muted py-4 small">${escapeHtml(hint)}</div>`;
             return;
         }
         renderChatSessions(chatSessionsCache);
-        mergeHydrationFallbackSessions();
     } catch (error) {
         console.error('获取会话列表失败:', error);
         body.innerHTML = '<div class="text-center text-muted py-4 small">加载失败</div>';
     }
+}
+
+function loadMoreChatSessions() {
+    if (!chatSessionsHasMore || !chatSessionsNextCursor) return;
+    refreshChatSessions(true);
 }
 
 function buildChatSessionsFromOrdersData(orders, cookieId) {
@@ -20888,21 +23037,36 @@ function renderChatSessions(sessions) {
         const displayName = resolveSessionDisplayName(session);
         const avatar = resolveSessionAvatar(session);
         const sessionState = getChatSessionState(session);
-        const preview = String(sessionState.preview || resolveSessionPreview(session)).substring(0, 30);
+        const preview = String(sessionState.preview || resolveSessionPreview(session)).substring(0, 42);
         const baseSubMeta = String(sessionState.submeta || '').trim();
         const priceMeta = session.item_price ? `<span class="chat-session-price">￥${escapeHtml(String(session.item_price))}</span>` : '';
+        const unread = Number(session.unread_count || 0);
+        const sourceTag = session.source === 'remote_im' ? '<span class="chat-session-source">IM</span>' : '';
         div.innerHTML = `
             <div class="chat-session-avatar">${avatar.type === 'image' ? `<img src="${escapeHtml(avatar.value)}" alt="avatar" class="chat-session-avatar-image">` : escapeHtml(avatar.value)}</div>
             <div class="chat-session-info">
-                <div class="chat-session-name">${escapeHtml(displayName)}</div>
+                <div class="chat-session-title-row">
+                    <div class="chat-session-name">${escapeHtml(displayName)}</div>
+                    ${sourceTag}
+                    ${unread > 0 ? `<span class="chat-session-unread">${unread > 99 ? '99+' : unread}</span>` : ''}
+                </div>
                 <div class="chat-session-preview">${escapeHtml(preview)}</div>
                 <div class="chat-session-submeta">${escapeHtml(baseSubMeta)}${priceMeta}</div>
             </div>
-            <div class="chat-session-time">${escapeHtml(formatChatTime(session.created_at))}</div>
+            <div class="chat-session-time">${escapeHtml(formatChatTime(session.created_at || session.lastMessageTime))}</div>
         `;
         div.onclick = () => selectChatSession(session);
         body.appendChild(div);
     });
+    if (chatSessionsHasMore) {
+        const more = document.createElement('button');
+        more.type = 'button';
+        more.className = 'chat-load-more-btn';
+        more.innerHTML = '<i class="bi bi-chevron-down"></i><span>加载更多会话</span>';
+        more.onclick = loadMoreChatSessions;
+        body.appendChild(more);
+    }
+    scheduleChatUserInfoHydration(sessions);
 }
 
 function mergeHydrationFallbackSessions() {
@@ -20940,20 +23104,27 @@ function filterChatSessions() {
         renderChatSessions(sortChatSessions(chatSessionsCache));
         return;
     }
+    const hasMoreBeforeFilter = chatSessionsHasMore;
+    chatSessionsHasMore = false;
     renderChatSessions(sortChatSessions(chatSessionsCache.filter(session =>
         String(session.sender_name || '').toLowerCase().includes(keyword)
         || String(session.buyer_name || '').toLowerCase().includes(keyword)
+        || String(session.item_title || '').toLowerCase().includes(keyword)
         || String(session.chat_id || '').includes(keyword)
         || String(normalizeChatSessionPreview(session.content, session.content_type) || '').toLowerCase().includes(keyword)
     )));
+    chatSessionsHasMore = hasMoreBeforeFilter;
 }
 
 async function selectChatSession(session) {
     session = { ...session, content: normalizeChatSessionPreview(session?.content, session?.content_type) };
     chatCurrentChatId = session.chat_id;
-    chatCurrentToUserId = session.buyer_id || (session.direction === 2 ? (session.sender_id || '') : '');
+    chatCurrentToUserId = session.buyer_id || session.sender_id || '';
     chatCurrentSenderName = resolveSessionDisplayName(session);
     chatCurrentItemId = session.item_id || '';
+    chatMessagesNextCursor = null;
+    chatMessagesHasMore = false;
+    chatMessagesSource = 'remote_im';
     chatOldestMsgId = null;
 
     const placeholder = document.getElementById('chatMainPlaceholder');
@@ -20964,32 +23135,16 @@ async function selectChatSession(session) {
     const headerName = document.getElementById('chatHeaderName');
     if (headerName) headerName.textContent = chatCurrentSenderName;
     updateChatHeaderMeta(session);
+    resetChatBlacklistState();
+    renderChatBlacklistButton();
+    if (chatCurrentToUserId) {
+        refreshChatBlacklistStatus();
+    }
 
     renderChatSessions(chatSessionsCache);
     await loadChatMessages(false);
-
-    try {
-        const result = await fetchJSON(`${apiBase}/api/chat/messages?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=50`);
-        if (result.success && Array.isArray(result.messages)) {
-            const buyerMessage = result.messages.find(message => message.direction === 2);
-            if (buyerMessage) {
-                if (!chatCurrentToUserId) chatCurrentToUserId = buyerMessage.sender_id;
-                if (!chatCurrentSenderName || chatCurrentSenderName === chatCurrentChatId) {
-                    chatCurrentSenderName = buyerMessage.sender_name || buyerMessage.sender_id || chatCurrentChatId;
-                    if (headerName) headerName.textContent = chatCurrentSenderName;
-                }
-            }
-            const messageWithItem = [...result.messages].reverse().find(message => {
-                const itemId = String(message.item_id || '');
-                return itemId && itemId !== 'None' && !itemId.startsWith('auto_');
-            });
-            if (messageWithItem) {
-                chatCurrentItemId = messageWithItem.item_id;
-                updateChatHeaderMeta({ ...session, item_id: chatCurrentItemId });
-            }
-        }
-    } catch (error) {
-        console.debug('补充会话信息失败:', error);
+    if (chatCurrentToUserId) {
+        refreshChatBlacklistStatus();
     }
 
     if (!document.getElementById('chatReplyPanel')?.classList.contains('d-none') && chatCurrentItemId) {
@@ -21007,8 +23162,19 @@ function shouldRebuildEmptySession(messages) {
     return false;
 }
 
-function renderChatEmptyState(session) {
-    return `<div class="text-center text-muted py-4"><div class="small">暂无消息记录</div></div>`;
+function renderChatEmptyState(session, hint = '暂无消息记录') {
+    const title = session?.source === 'remote_im' ? hint : (hint || '暂无消息记录');
+    return `<div class="text-center text-muted py-4"><div class="small">${escapeHtml(title)}</div></div>`;
+}
+
+function updateChatMessagePaging(result, messages) {
+    chatMessagesSource = result.source || 'local_cache';
+    chatMessagesNextCursor = result.next_cursor || null;
+    chatMessagesHasMore = Boolean(result.has_more && chatMessagesNextCursor);
+    if (chatMessagesSource === 'local_cache' && messages.length > 0) {
+        chatOldestMsgId = messages[0].id;
+        chatMessagesHasMore = Boolean(result.has_more && chatOldestMsgId);
+    }
 }
 
 async function loadChatMessages(append = false) {
@@ -21016,13 +23182,28 @@ async function loadChatMessages(append = false) {
     const area = document.getElementById('chatMessagesArea');
     if (!area) return;
     if (!append) {
+        chatMessagesNextCursor = null;
+        chatMessagesHasMore = false;
+        chatOldestMsgId = null;
         area.innerHTML = '<div class="text-center text-muted py-4"><div class="spinner-border spinner-border-sm"></div></div>';
     }
 
     try {
-        let url = `${apiBase}/api/chat/messages?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=50`;
-        if (append && chatOldestMsgId) {
-            url += `&before_id=${chatOldestMsgId}`;
+        let url = `${apiBase}/api/chat/messages?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=40`;
+        if (chatCurrentItemId) {
+            url += `&item_id=${encodeURIComponent(chatCurrentItemId)}`;
+        }
+        if (append) {
+            if (chatMessagesSource === 'remote_im' && chatMessagesNextCursor) {
+                url += `&remote=true&cursor=${encodeURIComponent(chatMessagesNextCursor)}`;
+            } else if (chatMessagesSource === 'local_cache' && chatOldestMsgId) {
+                url += `&remote=false&before_id=${encodeURIComponent(chatOldestMsgId)}`;
+            } else {
+                showToast('没有更多消息了', 'info');
+                return;
+            }
+        } else {
+            url += '&remote=true';
         }
         const result = await fetchJSON(url);
         if (!result.success) {
@@ -21030,19 +23211,39 @@ async function loadChatMessages(append = false) {
             return;
         }
         const messages = result.messages || [];
-        if (messages.length > 0) {
-            chatOldestMsgId = messages[0].id;
+        updateChatMessagePaging(result, messages);
+
+        const buyerMessage = messages.find(message => message.direction === 2);
+        if (buyerMessage && !chatCurrentToUserId) {
+            chatCurrentToUserId = buyerMessage.sender_id;
         }
+        const messageWithItem = [...messages].reverse().find(message => {
+            const itemId = String(message.item_id || '');
+            return itemId && itemId !== 'None' && !itemId.startsWith('auto_');
+        });
+        if (messageWithItem && !chatCurrentItemId) {
+            chatCurrentItemId = messageWithItem.item_id;
+            const currentSession = chatSessionsCache.find(item => item.chat_id === chatCurrentChatId) || {};
+            updateChatHeaderMeta({ ...currentSession, item_id: chatCurrentItemId });
+        }
+
         if (append) {
+            if (!messages.length) {
+                showToast('没有更多消息了', 'info');
+                return;
+            }
             const previousHeight = area.scrollHeight;
-            area.insertAdjacentHTML('afterbegin', renderChatMessages(messages));
+            area.querySelector('.chat-history-more')?.remove();
+            const moreButton = chatMessagesHasMore ? '<button type="button" class="chat-history-more" onclick="loadMoreChatMessages()"><i class="bi bi-clock-history"></i><span>加载更早消息</span></button>' : '';
+            area.insertAdjacentHTML('afterbegin', `${moreButton}${renderChatMessages(messages)}`);
             area.scrollTop = area.scrollHeight - previousHeight;
         } else {
             if (messages.length) {
-                area.innerHTML = renderChatMessages(messages);
+                const moreButton = chatMessagesHasMore ? '<button type="button" class="chat-history-more" onclick="loadMoreChatMessages()"><i class="bi bi-clock-history"></i><span>加载更早消息</span></button>' : '';
+                area.innerHTML = `${moreButton}${renderChatMessages(messages)}`;
             } else {
                 const currentSession = chatSessionsCache.find(item => item.chat_id === chatCurrentChatId) || {};
-                area.innerHTML = renderChatEmptyState(currentSession);
+                area.innerHTML = renderChatEmptyState(currentSession, result.remote_error || '暂无消息记录');
             }
             area.scrollTop = area.scrollHeight;
         }
