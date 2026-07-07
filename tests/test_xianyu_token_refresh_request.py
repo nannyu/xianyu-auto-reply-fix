@@ -1,6 +1,13 @@
 import unittest
+from unittest import mock
 
-from XianyuAutoAsync import XianyuLive
+from XianyuAutoAsync import ConnectionState, XianyuLive
+from utils.slider_orchestrator import (
+    extract_x5_cookies,
+    has_x5_cookie,
+    run_slider_with_fallback,
+    validate_slider_result,
+)
 
 
 class _FakeTokenRefreshResponse:
@@ -38,6 +45,102 @@ class _FakeSession:
             }
         )
         return self.response
+
+
+class SliderOrchestratorTest(unittest.TestCase):
+    def test_extracts_x5_cookie_variants(self):
+        cookies = {
+            "unb": "123",
+            "x5sec": "ticket",
+            "X5Step": "step",
+            "foo_x5sec_bar": "embedded",
+        }
+
+        self.assertEqual(
+            extract_x5_cookies(cookies),
+            {
+                "x5sec": "ticket",
+                "X5Step": "step",
+                "foo_x5sec_bar": "embedded",
+            },
+        )
+        self.assertTrue(has_x5_cookie(cookies))
+
+    def test_visual_success_without_x5_is_failure(self):
+        result = validate_slider_result(True, {"unb": "123", "cookie2": "abc"}, engine="playwright")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.engine, "playwright")
+        self.assertIn("未获取到 x5sec", result.message)
+        self.assertEqual(result.x5_cookies, {})
+
+    def test_success_requires_x5_cookie(self):
+        result = validate_slider_result(True, {"unb": "123", "x5sec": "ticket"}, engine="playwright")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.cookies["x5sec"], "ticket")
+        self.assertEqual(result.x5_cookies, {"x5sec": "ticket"})
+    def test_remote_solver_runs_before_local_slider_when_configured(self):
+        class _PrimarySlider:
+            user_id = "remote_user"
+            initial_cookies = "unb=remote_user; cookie2=old"
+            headless = True
+
+            def run(self, *_args, **_kwargs):
+                raise AssertionError("remote success should short-circuit local slider")
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "success": True,
+                    "data": {"cookies": {"unb": "remote_user", "x5sec": "remote_ticket"}},
+                }
+
+        with mock.patch("utils.slider_orchestrator.requests.post", return_value=_FakeResponse()) as post_mock:
+            result = run_slider_with_fallback(
+                _PrimarySlider(),
+                "https://example.com/punish?action=captcha",
+                remote_enabled=True,
+                remote_config=("https://remote.example/api/captcha/slider-solve", "secret"),
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.engine, "remote")
+        self.assertEqual(result.x5_cookies, {"x5sec": "remote_ticket"})
+        self.assertEqual(post_mock.call_args.kwargs["json"]["secret_key"], "secret")
+
+    def test_drissionpage_fallback_can_recover_primary_failure(self):
+        class _PrimarySlider:
+            user_id = "fallback_user"
+            initial_cookies = "unb=fallback_user; cookie2=old"
+            headless = True
+
+            def run(self, *_args, **_kwargs):
+                return True, {"unb": "fallback_user"}
+
+        class _FallbackHandler:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def get_cookies(self, url, existing_cookies_str=None, cookie_id="unknown"):
+                self.url = url
+                self.existing_cookies_str = existing_cookies_str
+                self.cookie_id = cookie_id
+                return "unb=fallback_user; x5sec=fallback_ticket"
+
+        result = run_slider_with_fallback(
+            _PrimarySlider(),
+            "https://example.com/punish?action=captcha",
+            fallback_enabled=True,
+            handler_factory=_FallbackHandler,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.engine, "drissionpage")
+        self.assertEqual(result.x5_cookies, {"x5sec": "fallback_ticket"})
 
 
 class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
@@ -126,6 +229,7 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={}), \
              mock.patch("XianyuAutoAsync.log_captcha_event"), \
+             mock.patch.dict("os.environ", {"XY_SLIDER_DRISSION_FALLBACK": "0"}), \
              mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", _FakeSlider):
             result = await live._handle_captcha_verification(
                 {"data": {"url": "https://example.com/punish?action=captcha"}}
@@ -164,6 +268,7 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch("XianyuAutoAsync.db_manager.get_cookie_details", return_value={}), \
              mock.patch("XianyuAutoAsync.log_captcha_event"), \
+             mock.patch.dict("os.environ", {"XY_SLIDER_DRISSION_FALLBACK": "0"}), \
              mock.patch("utils.xianyu_slider_stealth.XianyuSliderStealth", _FakeSlider):
             result = await live._handle_captcha_verification(
                 {"data": {"url": "https://example.com/punish?action=captcha"}}

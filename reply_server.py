@@ -5874,6 +5874,7 @@ async def _execute_manual_cookie_import(
             XianyuSliderStealth,
             probe_cookie_verification_from_cookie,
         )
+        from utils.slider_orchestrator import run_slider_with_fallback
         from XianyuAutoAsync import XianyuLive
 
         existing_cookie_info = db_manager.get_cookie_details(account_id) or {}
@@ -6058,18 +6059,20 @@ async def _execute_manual_cookie_import(
                     )
                 log_with_user('info', f"手动导入 Cookie 已解析 verification_url: {account_id}", current_user)
 
-                success, cookies_dict = slider_instance.run(
+                strict_result = run_slider_with_fallback(
+                    slider_instance,
                     target_url,
+                    engine="playwright",
                     notification_callback=notification_callback,
                     notification_scene='手动导入 Cookie',
                 )
-                if not success or not cookies_dict:
-                    failure_message = slider_instance._get_slider_failure_message('滑块验证失败，请稍后重试')
+                if not strict_result.success or not strict_result.cookies:
+                    failure_message = slider_instance._get_slider_failure_message(strict_result.message)
                     _set_manual_cookie_import_session_status(session_id, 'failed', error=failure_message)
                     log_with_user('error', f"手动导入 Cookie 验证失败: {account_id}, 错误: {failure_message}", current_user)
                     return
 
-                merged_cookies_dict = merge_cookie_dicts_for_import(cookies_dict, '浏览器验证')
+                merged_cookies_dict = merge_cookie_dicts_for_import(strict_result.cookies, '浏览器验证')
                 persist_manual_cookie_import_success(merged_cookies_dict, '浏览器验证')
             except Exception as exc:
                 error_message = str(exc)
@@ -6532,8 +6535,9 @@ async def get_account_face_verification_screenshot(
                     }
 
         latest_verification_log = _get_latest_verification_risk_log_for_account(account_id)
-        if latest_verification_log and str(latest_verification_log.get('processing_status') or '').strip().lower() == 'failed':
-            if _is_timed_out_verification_risk_log(latest_verification_log):
+        if latest_verification_log:
+            log_status = str(latest_verification_log.get('processing_status') or '').strip().lower()
+            if log_status == 'failed' and _is_timed_out_verification_risk_log(latest_verification_log):
                 timeout_message = (
                     str(latest_verification_log.get('error_message') or '').strip()
                     or '当前验证页面已超时/失效，请重新发起验证'
@@ -6543,7 +6547,14 @@ async def get_account_face_verification_screenshot(
                     'success': False,
                     'message': timeout_message
                 }
-        
+            if log_status == 'success':
+                # 最近一次验证已完成，历史截图仅作留档，不应再当成待处理验证展示
+                log_with_user('info', f"账号 {account_id} 最新验证已完成，无待处理验证", current_user)
+                return {
+                    'success': False,
+                    'message': '最近一次验证已完成，当前没有待处理的验证'
+                }
+
         # 获取该账号的验证截图
         screenshots_dir = os.path.join(static_dir, 'uploads', 'images')
         pattern_jpg = os.path.join(screenshots_dir, f'face_verify_{account_id}_*.jpg')
@@ -10376,6 +10387,7 @@ async def _publish_product_to_account(
     delivery_choice: str,
     post_price: Optional[float],
     can_self_pickup: bool,
+    category_hint: Optional[str] = None,
     material_id: Optional[int] = None,
     batch_id: Optional[str] = None,
     log_id: Optional[int] = None,
@@ -10440,12 +10452,15 @@ async def _publish_product_to_account(
                 delivery_choice=delivery_choice,
                 post_price=post_price_value,
                 can_self_pickup=bool(can_self_pickup),
+                category_hint=category_hint,
             )
             latest_cookies_str = publisher.cookies_str
             published_item_id = publisher.extract_published_item_id(publish_result)
 
             if not publisher.is_success_response(publish_result):
                 error_message = publisher.extract_error_message(publish_result)
+                if publisher.is_category_path_error(publish_result):
+                    error_message = publisher.build_category_path_error_message(publish_result)
                 if created_log_id:
                     db_manager.update_publish_log(
                         created_log_id,
@@ -10559,6 +10574,7 @@ async def _run_product_batch_publish(batch_id: str, jobs: List[Dict[str, Any]], 
                 delivery_choice=material.get('delivery_method') or '包邮',
                 post_price=material.get('postage'),
                 can_self_pickup=bool(material.get('can_self_pickup')),
+                category_hint=material.get('category'),
                 material_id=material.get('id'),
                 batch_id=batch_id,
                 log_id=log_id,
@@ -10722,6 +10738,7 @@ async def publish_product_json(
         delivery_choice=data.get('delivery_method') or '包邮',
         post_price=data.get('postage'),
         can_self_pickup=bool(data.get('can_self_pickup')),
+        category_hint=data.get('category'),
     )
 
 
@@ -10938,6 +10955,7 @@ async def publish_item(
     cookie_id: str = Form(...),
     title: str = Form(...),
     description: str = Form(default=""),
+    category: str = Form(default=""),
     current_price: str = Form(default=""),
     original_price: str = Form(default=""),
     delivery_choice: str = Form(...),
@@ -10972,6 +10990,7 @@ async def publish_item(
         delivery_choice=delivery_choice,
         post_price=post_price,
         can_self_pickup=_parse_form_bool(can_self_pickup),
+        category_hint=category,
     )
 
 

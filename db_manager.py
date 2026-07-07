@@ -874,6 +874,7 @@ class DBManager:
                 session_id TEXT,
                 trigger_scene TEXT,
                 result_code TEXT,
+                captcha_engine TEXT,
                 event_description TEXT,
                 event_meta TEXT,
                 processing_result TEXT,
@@ -1108,6 +1109,7 @@ Cookie数量: {cookie_count}
                 'session_id': "TEXT",
                 'trigger_scene': "TEXT",
                 'result_code': "TEXT",
+                'captcha_engine': "TEXT",
                 'event_meta': "TEXT",
                 'duration_ms': "INTEGER",
             }
@@ -9109,7 +9111,8 @@ Cookie数量: {cookie_count}
                            event_description: str = None, processing_result: str = None,
                            processing_status: str = 'processing', error_message: str = None,
                            session_id: str = None, trigger_scene: str = None,
-                           result_code: str = None, event_meta: Any = None,
+                           result_code: str = None, captcha_engine: str = None,
+                           event_meta: Any = None,
                            duration_ms: Optional[int] = None):
         """
         添加风控日志记录
@@ -9135,15 +9138,16 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 cursor.execute('''
                     INSERT INTO risk_control_logs
-                    (cookie_id, event_type, session_id, trigger_scene, result_code, event_description,
+                    (cookie_id, event_type, session_id, trigger_scene, result_code, captcha_engine, event_description,
                      event_meta, processing_result, processing_status, error_message, duration_ms)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     cookie_id,
                     event_type,
                     session_id,
                     trigger_scene,
                     result_code,
+                    captcha_engine,
                     event_description,
                     self._serialize_risk_control_event_meta(event_meta),
                     processing_result,
@@ -9161,6 +9165,7 @@ Cookie数量: {cookie_count}
                               processing_result: str = None, processing_status: str = None,
                               error_message: str = None, session_id: str = None,
                               trigger_scene: str = None, result_code: str = None,
+                              captcha_engine: str = None,
                               event_meta: Any = None, duration_ms: Optional[int] = None) -> bool:
         """
         更新风控日志记录
@@ -9216,6 +9221,10 @@ Cookie数量: {cookie_count}
                     update_fields.append("result_code = ?")
                     params.append(result_code)
 
+                if captcha_engine is not None:
+                    update_fields.append("captcha_engine = ?")
+                    params.append(captcha_engine)
+
                 if event_meta is not None:
                     update_fields.append("event_meta = ?")
                     params.append(self._serialize_risk_control_event_meta(event_meta))
@@ -9237,6 +9246,40 @@ Cookie数量: {cookie_count}
         except Exception as e:
             logger.error(f"更新风控日志失败: {e}")
             return False
+
+    def resolve_pending_verification_risk_logs(self, cookie_id: str,
+                                               processing_result: str = '验证已完成',
+                                               result_code: str = 'verification_resolved') -> int:
+        """将指定账号所有悬挂在 processing/pending 状态的验证类风控日志批量置为成功。
+
+        人脸/扫码等验证在检测阶段会写入 processing 状态日志，验证完成后若不回填，
+        前端"查看验证截图"会一直把历史截图当成待处理验证展示。
+
+        Returns:
+            int: 更新的记录数
+        """
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE risk_control_logs
+                    SET processing_status = 'success',
+                        processing_result = ?,
+                        result_code = ?,
+                        error_message = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE cookie_id = ?
+                      AND event_type IN ('face_verify', 'qr_verify', 'sms_verify', 'unknown')
+                      AND processing_status IN ('processing', 'pending')
+                    """,
+                    (processing_result, result_code, str(cookie_id)),
+                )
+                self.conn.commit()
+                return cursor.rowcount
+        except Exception as e:
+            logger.error(f"批量回填验证风控日志状态失败: {e}")
+            return 0
 
     def get_risk_control_logs(self, cookie_id: str = None, processing_status: str = None,
                               event_type: str = None, trigger_scene: str = None,

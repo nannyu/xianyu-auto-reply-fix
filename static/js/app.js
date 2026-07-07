@@ -11332,6 +11332,7 @@ function getItemPublishFormValues() {
     return {
         accountId: document.getElementById('publishCookieId')?.value || '',
         title: document.getElementById('publishTitle')?.value.trim() || '',
+        category: document.getElementById('publishCategory')?.value.trim() || '',
         description: document.getElementById('publishDescription')?.value.trim() || '',
         currentPrice: document.getElementById('publishCurrentPrice')?.value.trim() || '',
         originalPrice: document.getElementById('publishOriginalPrice')?.value.trim() || '',
@@ -11401,6 +11402,7 @@ function buildItemPublishJsonPayload(values, images) {
         account_id: values.accountId,
         title: values.title,
         description: values.description,
+        category: values.category,
         price: parseOptionalPublishNumber(values.currentPrice, '现价'),
         original_price: parseOptionalPublishNumber(values.originalPrice, '原价'),
         images,
@@ -11568,13 +11570,14 @@ function renderItemPublishMaterials() {
         const image = Array.isArray(material.images) && material.images.length ? material.images[0] : null;
         const imageSrc = getItemPublishImageSrc(image);
         const priceText = material.price !== null && material.price !== undefined ? `¥${material.price}` : '默认价';
+        const categoryText = material.category ? ` · ${material.category}` : '';
         const imageCount = Array.isArray(material.images) ? material.images.length : 0;
         return `
             <div class="item-publish-side-item ${itemPublishLoadedMaterialId === material.id ? 'is-active' : ''}">
                 ${imageSrc ? `<img class="item-publish-side-thumb" src="${escapeHtml(imageSrc)}" alt="素材图">` : '<div class="item-publish-side-thumb is-empty"><i class="bi bi-image"></i></div>'}
                 <div class="item-publish-side-main">
                     <div class="item-publish-side-title" title="${escapeHtml(material.title || '')}">${escapeHtml(material.title || '未命名素材')}</div>
-                    <div class="item-publish-side-meta">${escapeHtml(priceText)} · ${imageCount} 张图</div>
+                    <div class="item-publish-side-meta">${escapeHtml(priceText)} · ${imageCount} 张图${escapeHtml(categoryText)}</div>
                     <div class="item-publish-side-actions">
                         <button type="button" class="btn btn-sm btn-outline-primary" onclick="loadItemPublishMaterialToForm(${material.id})">载入</button>
                         <button type="button" class="btn btn-sm btn-outline-danger" onclick="deleteItemPublishMaterial(${material.id})">删除</button>
@@ -11593,6 +11596,7 @@ function loadItemPublishMaterialToForm(materialId) {
     }
 
     document.getElementById('publishTitle').value = material.title || '';
+    document.getElementById('publishCategory').value = material.category || '';
     document.getElementById('publishDescription').value = material.description || '';
     document.getElementById('publishCurrentPrice').value = material.price ?? '';
     document.getElementById('publishOriginalPrice').value = material.original_price ?? '';
@@ -11714,6 +11718,7 @@ async function submitItemPublishForm() {
             const formData = new FormData();
             formData.append('cookie_id', values.accountId);
             formData.append('title', values.title);
+            formData.append('category', values.category);
             formData.append('description', values.description);
             formData.append('current_price', values.currentPrice);
             formData.append('original_price', values.originalPrice);
@@ -19690,6 +19695,33 @@ function getRiskTriggerSceneLabel(triggerScene) {
     return sceneLabels[normalizedScene] || normalizedScene || '-';
 }
 
+function getRiskCaptchaEngineMeta(log = {}) {
+    const meta = log && typeof log.event_meta === 'object' && log.event_meta ? log.event_meta : {};
+    const normalizedEngine = String(log.captcha_engine || meta.captcha_engine || '').trim().toLowerCase();
+    const engineMap = {
+        playwright: { label: 'Playwright', className: 'bg-primary' },
+        drissionpage: { label: 'Drission', className: 'bg-info text-dark' },
+        remote: { label: '远程', className: 'bg-dark' },
+        real_mouse: { label: '真实鼠标', className: 'bg-success' },
+        manual: { label: '手动', className: 'bg-secondary' }
+    };
+
+    if (!normalizedEngine) {
+        return { label: '-', className: 'bg-light text-muted border', raw: '' };
+    }
+
+    return {
+        ...(engineMap[normalizedEngine] || { label: normalizedEngine, className: 'bg-secondary' }),
+        raw: normalizedEngine
+    };
+}
+
+function renderRiskCaptchaEngineCell(log = {}) {
+    const engine = getRiskCaptchaEngineMeta(log);
+    const title = engine.raw ? `验证引擎: ${engine.raw}` : '暂无验证引擎记录';
+    return `<span class="badge ${engine.className}" title="${escapeHtml(title)}">${escapeHtml(engine.label)}</span>`;
+}
+
 function formatRiskDuration(durationMs) {
     const value = Number(durationMs);
     if (!Number.isFinite(value) || value <= 0) {
@@ -19797,6 +19829,7 @@ function displayRiskControlLogs(logs) {
             <td class="text-nowrap">${eventCategoryBadge}</td>
             <td class="text-nowrap">${triggerSceneBadge}</td>
             <td>${statusBadge}</td>
+            <td class="text-nowrap">${renderRiskCaptchaEngineCell(log)}</td>
             <td class="risk-log-cell-summary">${renderRiskLogSummaryCell(log)}</td>
             <td class="risk-log-cell-outcome">${renderRiskLogOutcomeCell(log)}</td>
             <td class="text-nowrap">${escapeHtml(durationText)}</td>
@@ -20464,7 +20497,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v2.0.3';
+const DEFAULT_VERSION = 'v2.0.4';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -20575,15 +20608,30 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v2.0.3',
+    version: 'v2.0.4',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v2.0.4',
+            date: '2026-07-07',
+            updates: [
+                '【新功能】新增 noVNC 手动风控接管入口，Docker 环境可通过浏览器远程查看并人工处理滑块、验证码和账号风险提示',
+                '【新功能】新增远程滑块服务与统一滑块兜底编排，外部服务可接收验证 URL 并回传有效 x5sec Cookie',
+                '【优化】风控日志与滑块统计展示验证引擎来源，便于区分 Playwright、DrissionPage、远程和手动处理链路',
+                '【优化】商品发布支持类目提示，参与闲鱼类目推荐并在类目路径查询失败时给出更明确处理建议',
+                '【优化】补强订单恢复与待补确认处理，支持按订单信息恢复待补订单并衔接自动发货流程',
+                '【修复】严格校验滑块 x5sec 结果，避免无效 Cookie 或未通过滑块的结果被误判为成功',
+                '【修复】修复浏览器进程清理、账号任务残留和验证完成后历史截图误报，提升登录/验证收尾稳定性',
+                '【文档】整理 README Star History 区块 HTML 缩进，保持文档结构一致'
+            ]
+        },
         {
             version: 'v2.0.3',
             date: '2026-06-16',
             updates: [
                 '【新功能】新增待补确认订单补偿能力，发货后平台确认失败的订单会记录待补确认状态并提供补偿入口',
                 '【新功能】在线客服会话新增拉黑入口，便于快速处理异常买家或商品会话',
+                '【优化】商品发布支持填写类目提示，参与闲鱼类目推荐并在类目路径查询失败时给出明确处理建议',
                 '【优化】会话预览优先显示最新消息，补全客服会话头像昵称，并将客服订单入口跳转到独立订单页',
                 '【修复】停止终态订单重复补确认，避免已完成、已关闭等终态订单被重复处理',
                 '【文档】精简 README 并拆分部署、配置、使用、FAQ 和发版说明文档'
