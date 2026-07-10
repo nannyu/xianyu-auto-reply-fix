@@ -9628,11 +9628,16 @@ async function editCard(cardId) {
 
         // 根据类型填充特定字段
         if (card.type === 'api' && card.api_config) {
+        // 记住原始 api_config，保存时合并回去，避免表单未覆盖的扩展字段被丢弃
+        window._editingCardApiConfig = card.api_config;
+        // headers/params 可能是对象（后端存的是嵌套 JSON），需要序列化后再填入文本框，
+        // 否则会变成 "[object Object]" 导致保存时 JSON 校验报错
+        const _fmtJsonField = (v) => (typeof v === 'string' ? v : JSON.stringify(v || {}, null, 2));
         document.getElementById('editApiUrl').value = card.api_config.url || '';
         document.getElementById('editApiMethod').value = card.api_config.method || 'GET';
         document.getElementById('editApiTimeout').value = card.api_config.timeout || 10;
-        document.getElementById('editApiHeaders').value = card.api_config.headers || '{}';
-        document.getElementById('editApiParams').value = card.api_config.params || '{}';
+        document.getElementById('editApiHeaders').value = _fmtJsonField(card.api_config.headers);
+        document.getElementById('editApiParams').value = _fmtJsonField(card.api_config.params);
         } else if (card.type === 'yifan_api' && card.api_config) {
         document.getElementById('editYifanUserId').value = card.api_config.user_id || '';
         document.getElementById('editYifanUserKey').value = card.api_config.user_key || '';
@@ -9807,13 +9812,14 @@ async function updateCard() {
             return;
         }
 
-        cardData.api_config = {
+        // 以原始 api_config 为底合并表单字段，保留表单未覆盖的扩展配置
+        cardData.api_config = Object.assign({}, window._editingCardApiConfig || {}, {
             url: document.getElementById('editApiUrl').value,
             method: document.getElementById('editApiMethod').value,
-            timeout: parseInt(document.getElementById('editApiTimeout').value),
+            timeout: parseInt(document.getElementById('editApiTimeout').value) || 10,
             headers: headers,
             params: params
-        };
+        });
         break;
         case 'yifan_api':
         // 验证必填字段
@@ -20497,7 +20503,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v2.0.4';
+const DEFAULT_VERSION = 'v2.0.5';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -20608,9 +20614,19 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v2.0.4',
+    version: 'v2.0.5',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v2.0.5',
+            date: '2026-07-10',
+            updates: [
+                '【修复】API 卡券 GET 请求同样替换动态参数占位符，避免 {order_id} 等 query 参数原样发送导致卡密串用',
+                '【修复】编辑 API 卡券时正确格式化嵌套 JSON headers/params，保存时保留表单未覆盖的扩展配置',
+                '【修复】退款完成后的“交易关闭”轻量提醒支持按会话 sid 唯一回填，避免订单长期停留在退款中',
+                '【修复】本账号作为买家咨询或购买别人商品时，不再触发自动回复或 AI 回复'
+            ]
+        },
         {
             version: 'v2.0.4',
             date: '2026-07-07',
